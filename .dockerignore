@@ -1,0 +1,113 @@
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE files
+.vscode/
+.github/
+.azure/
+.idea/
+*.swp
+*.swo
+.azdignore
+azure.yaml
+
+# OS files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Environment files
+.env*
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Git
+.git
+.gitignore
+
+# Docker
+Dockerfile
+.dockerignore
+
+# Test coverage
+.coverage
+htmlcov/
+.pytest_cache/
+tests/
+
+# Temporary files
+tmp/
+temp/
+
+# Markdown files
+*.md
+
+# Node modules
+*/node_modules/
+*/dist/
+
+# infra files
+infra/
+
+# Local environments and output folders
+asg_env/
+AI_Output/
+browser_jsons/
+browser_reports_25/
+browser_response/
+BROWSER_UPDATED/
+BROWSER_VALIDATION/
+FIELDS/
+JSON_AI/
+JSONS_UPDATED_ASG/
+NAMES_OUTPUT/
+NEW_JSONS/
+output_json/
+output_updated_json/
+results/
+UPDATED_JSON/
+UPDATED_JSONS_ASG/
+UPDATED_OUTPUT_JSON/
+validation_reports_25/
+web_jsons/
+WEB_RESULTS/
+WEB_VALIDATION/
+web_validation_reports/
+websites/
+websites_validation/
+pipelines_local/
+assets/

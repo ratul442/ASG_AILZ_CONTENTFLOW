@@ -1,0 +1,359 @@
+"""Azure Content Understanding executor for document analysis and extraction."""
+
+from datetime import datetime
+import logging
+from typing import Dict, Any, Optional, List, Union
+
+from agent_framework import WorkflowContext
+
+from . import ParallelExecutor
+from ..models import Content, ExecutorLogEntry
+from ..connectors import ContentUnderstandingConnector
+
+logger = logging.getLogger("contentflow.executors.azure_content_understanding_extractor")
+
+
+class AzureContentUnderstandingExtractorExecutor(ParallelExecutor):
+    """
+    Extract content from documents using Azure Content Understanding.
+    
+    This executor analyzes documents to extract text, layout, tables,
+    fields, and structured data using Azure Content Understanding service.
+    
+    Configuration (settings dict):
+        - analyzer_id (str): Content Understanding analyzer to use
+          Default: "prebuilt-documentSearch"
+          Options: "prebuilt-documentSearch", "prebuilt-layout", "prebuilt-read",
+                   "prebuilt-invoice", "prebuilt-receipt", etc.
+        - content_field (str): Field containing document bytes
+          Default: None
+        - temp_file_path_field (str): Field containing temp file path
+          Default: "temp_file_path"
+        - url_field (str): Field containing document URL
+          Default: "url"
+        - output_field (str): Field name for extracted data
+          Default: "content_understanding_output"
+        - content_understanding_endpoint (str): Content Understanding service endpoint
+          Default: None (must be provided)
+        - content_understanding_credential_type (str): Credential type for service
+          Default: "default_azure_credential"
+          Options: "azure_key_credential", "default_azure_credential"
+        - content_understanding_subscription_key (str): Subscription key if needed
+          Default: None
+        - content_understanding_api_version (str): API version to use
+          Default: "2025-11-01"
+        - content_understanding_timeout (int): Timeout in seconds for service calls
+          Default: 60
+        - content_understanding_model_mappings (str): Default model deployment mappings in Json format.
+          Default: None
+        - retrieve_figures (bool): Whether to retrieve figure/image files from the analysis result.
+          When True, the executor scans the analysis result for figures and downloads
+          each figure's image bytes via the Content Understanding Get Result File API.
+          Default: False
+        - figures_output_field (str): Field name for storing retrieved figure data.
+          Default: "figures"
+
+        Also setting from ParallelExecutor and BaseExecutor apply.
+        
+    Example:
+        ```python
+        executor = AzureContentUnderstandingExtractorExecutor(
+            id="content_understanding_extractor",
+            settings={
+                "analyzer_id": "prebuilt-documentSearch",
+                "content_understanding_endpoint": "<your_endpoint>",
+            }
+        )
+        ```
+    
+    Input:
+        Document or List[Document] each with (ContentIdentifier) id containing:
+        - data['content']: Document bytes, OR
+        - data['temp_file_path']: Path to document file, OR
+    
+    Output:
+        Document or List[Document] with added fields:
+        - data['content_understanding_output']: Dict with content from Azure Content Understanding
+    """
+    
+    def __init__(
+        self,
+        id: str,
+        settings: Optional[Dict[str, Any]] = None,
+        **kwargs
+    ):
+        super().__init__(
+            id=id,
+            settings=settings,
+            **kwargs
+        )
+        
+        # Extract configuration
+        self.analyzer_id = self.get_setting("analyzer_id", default="prebuilt-documentSearch")
+        self.content_field = self.get_setting("content_field", default=None)
+        self.temp_file_field = self.get_setting("temp_file_path_field", default="temp_file_path")
+        self.output_field = self.get_setting("output_field", default="content_understanding_output")
+        self.retrieve_figures = self.get_setting("retrieve_figures", default=False)
+        self.figures_output_field = self.get_setting("figures_output_field", default="figures")
+        
+        # Content Understanding connector config
+        self.content_understanding_endpoint = self.get_setting("content_understanding_endpoint", default=None, required=True)
+        if not self.content_understanding_endpoint:
+            raise ValueError(f"{self.id}: Content Understanding endpoint must be provided in settings")
+        
+        self.content_understanding_credential_type = self.get_setting(
+            "content_understanding_credential_type", 
+            default="default_azure_credential"
+        )
+        self.content_understanding_subscription_key = self.get_setting(
+            "content_understanding_subscription_key", 
+            default=None
+        )
+        self.content_understanding_api_version = self.get_setting(
+            "content_understanding_api_version", 
+            default="2025-11-01"
+        )
+        self.content_understanding_timeout = self.get_setting(
+            "content_understanding_timeout", 
+            default=180
+        )
+        self.content_understanding_polling_interval = self.get_setting(
+            "content_understanding_polling_interval", 
+            default=2
+        )
+        self.content_understanding_max_retries = self.get_setting(
+            "content_understanding_max_retries",
+            default=3
+        )
+        self.content_understanding_retry_backoff_factor = self.get_setting(
+            "content_understanding_retry_backoff_factor",
+            default=2.0
+        )
+        self.content_understanding_model_mappings = self.get_setting(
+            "content_understanding_model_mappings",
+            default=None,
+            required=True
+        )
+        if not isinstance(self.content_understanding_model_mappings, str):
+            raise ValueError(f"{self.id}: 'content_understanding_model_mappings' must be a JSON string of model to deployment ID mappings.")
+        try:
+            import json
+            self.content_understanding_model_mappings = json.loads(self.content_understanding_model_mappings)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"{self.id}: Failed to parse 'content_understanding_model_mappings' JSON string: {e}")
+        
+        # Create connector
+        connector_settings = {
+            "endpoint": self.content_understanding_endpoint,
+            "credential_type": self.content_understanding_credential_type,
+            "api_version": self.content_understanding_api_version,
+            "timeout": self.content_understanding_timeout,
+            "polling_interval": self.content_understanding_polling_interval,
+            "default_model_deployments": self.content_understanding_model_mappings,
+            "max_retries": self.content_understanding_max_retries,
+            "retry_backoff_factor": self.content_understanding_retry_backoff_factor
+        }
+        
+        if self.content_understanding_subscription_key:
+            connector_settings["subscription_key"] = self.content_understanding_subscription_key
+        
+        self.content_understanding_connector: ContentUnderstandingConnector = ContentUnderstandingConnector(
+            name="content_understanding_connector",
+            settings=connector_settings
+        )
+        
+        if self.debug_mode:
+            logger.debug(
+                f"AzureContentUnderstandingExtractorExecutor {self.id} initialized: "
+                f"analyzer={self.analyzer_id}"
+            )
+
+    async def process_content_item(
+        self,
+        content: Content
+    ) -> Content:
+        """Process a single content item using Azure Content Understanding.
+           Implements the abstract method from ParallelExecutor.
+        """
+
+        # Initialize the connector
+        await self.content_understanding_connector.initialize()
+        
+        try:
+            if not content or not content.data:
+                raise ValueError("Content must have data")
+            
+            # Determine input type and analyze accordingly
+            analysis_result = None
+            
+            # Priority: temp_file > content bytes
+            if self.temp_file_field in content.data:
+                temp_file_path = content.data[self.temp_file_field]
+                
+                if self.debug_mode:
+                    logger.debug(
+                        f"Analyzing document {content.id} from file '{temp_file_path}' "
+                        f"with analyzer '{self.analyzer_id}'"
+                    )
+                
+                analysis_result = await self.content_understanding_connector.analyze_document_binary(
+                    file_path=temp_file_path,
+                    analyzer_id=self.analyzer_id
+                )
+            
+            elif self.content_field and self.content_field in content.data:
+                # Need to write to temp file for binary analysis
+                import tempfile
+                
+                content_bytes = content.data[self.content_field]
+                
+                # Create temp file
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".tmp") as tmp_file:
+                    tmp_file.write(content_bytes)
+                    tmp_file_path = tmp_file.name
+                
+                if self.debug_mode:
+                    logger.debug(
+                        f"Analyzing document {content.id} from bytes ({len(content_bytes)} bytes) "
+                        f"with analyzer '{self.analyzer_id}'"
+                    )
+                
+                try:
+                    analysis_result = await self.content_understanding_connector.analyze_document_binary(
+                        file_path=tmp_file_path,
+                        analyzer_id=self.analyzer_id
+                    )
+                finally:
+                    # Clean up temp file
+                    import os
+                    try:
+                        os.unlink(tmp_file_path)
+                    except Exception:
+                        pass
+            
+            else:
+                raise ValueError(
+                    f"Document missing required content. "
+                    f"Needs one of: '{self.url_field}', '{self.temp_file_field}', or '{self.content_field}'"
+                )
+            
+            # Store response as output
+            content.data[f"{self.output_field}"] = analysis_result
+            
+            # Optionally retrieve figures from the result
+            if self.retrieve_figures:
+                figures_data = await self._retrieve_figures(analysis_result)
+                if figures_data:
+                    content.data[self.figures_output_field] = figures_data
+                    if self.debug_mode:
+                        logger.debug(
+                            f"Retrieved {len(figures_data)} figure(s) for document {content.id}"
+                        )
+            
+            # Update summary
+            content.summary_data['extraction_status'] = "success"
+            content.summary_data['analyzer_id'] = self.analyzer_id
+
+        except Exception as e:
+            logger.error(
+                f"AzureContentUnderstandingExtractorExecutor {self.id} failed processing document {content.id}",
+                exc_info=True
+            )
+            logger.exception(e)
+            
+            # raise the exception to be handled upstream if needed
+            raise
+        
+        return content
+
+    async def _retrieve_figures(
+        self,
+        analysis_result: Dict[str, Any]
+    ) -> List[Dict[str, Any]]:
+        """
+        Retrieve figure/image files from an analysis result.
+        
+        Scans the analysis result for figures and downloads each figure's
+        binary content using the Content Understanding Get Result File API.
+        
+        See: https://learn.microsoft.com/en-us/rest/api/contentunderstanding/
+             content-analyzers/get-result-file?view=rest-contentunderstanding-2025-11-01
+        
+        Args:
+            analysis_result: The completed analysis result dict from Content Understanding.
+            
+        Returns:
+            A list of dicts, each containing:
+                - id (str): The figure identifier
+                - bytes (bytes): The figure image binary data
+                - content_type (str): Inferred content type (e.g. "image/png")
+                - Additional metadata from the figure element (boundingRegions, spans, etc.)
+        """
+        operation_id = analysis_result.get("id")
+        if not operation_id:
+            logger.warning("No operation ID found in analysis result; cannot retrieve figures.")
+            return []
+        
+        # Navigate to figures in the result structure
+        result = analysis_result.get("result", {})
+        contents = result.get("contents", [])
+        
+        figures = []
+        for content_item in contents:
+            content_figures = content_item.get("figures", [])
+            figures.extend(content_figures)
+        
+        if not figures:
+            if self.debug_mode:
+                logger.debug(f"No figures found in analysis result for operation {operation_id}")
+            return []
+        
+        logger.info(
+            f"Found {len(figures)} figure(s) in analysis result for operation {operation_id}. "
+            f"Retrieving figure files..."
+        )
+        
+        retrieved_figures: List[Dict[str, Any]] = []
+        
+        for figure in figures:
+            figure_id = figure.get("id", "")
+            if not figure_id:
+                logger.warning("Figure entry missing 'id', skipping.")
+                continue
+            
+            # The file path for the Get Result File API
+            file_path = f"files/figures/{figure_id}"
+            
+            try:
+                figure_bytes = await self.content_understanding_connector.get_result_file(
+                    operation_id=operation_id,
+                    file_path=file_path
+                )
+                
+                figure_data: Dict[str, Any] = {
+                    "id": figure_id,
+                    "bytes": figure_bytes,
+                    "content_type": "image/png",
+                }
+                
+                # Carry over useful metadata from the figure element
+                for key in ("boundingRegions", "source", "span", "caption", "description", "elements"):
+                    if key in figure:
+                        figure_data[key] = figure[key]
+                
+                retrieved_figures.append(figure_data)
+                
+                if self.debug_mode:
+                    logger.debug(
+                        f"Retrieved figure '{figure_id}' ({len(figure_bytes)} bytes) "
+                        f"for operation {operation_id}"
+                    )
+                    
+            except Exception as e:
+                logger.warning(
+                    f"Failed to retrieve figure '{figure_id}' for operation {operation_id}: {e}"
+                )
+                # Continue retrieving remaining figures
+                continue
+        
+        return retrieved_figures

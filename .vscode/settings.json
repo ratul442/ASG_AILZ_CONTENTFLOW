@@ -1,0 +1,12 @@
+{
+    "python.analysis.extraPaths": [
+        "./contentflow-lib"
+    ],
+    "python-envs.pythonProjects": [
+        {
+            "path": "pipelines_local/output",
+            "envManager": "ms-python.python:venv",
+            "packageManager": "ms-python.python:pip"
+        }
+    ]
+}

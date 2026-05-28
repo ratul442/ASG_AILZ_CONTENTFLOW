@@ -1,0 +1,601 @@
+"""Azure Blob Input executor for discovering and listing content files from blob storage."""
+
+from datetime import datetime
+import logging
+from pathlib import Path
+from typing import AsyncGenerator, Dict, Any, List, Optional, Union
+
+from agent_framework import WorkflowContext
+
+from .input_executor import InputExecutor
+from ..models import Content, ContentIdentifier, ExecutorLogEntry
+from ..connectors import AzureBlobConnector
+
+logger = logging.getLogger("contentflow.executors.azure_blob_input_discovery")
+
+
+class AzureBlobInputDiscoveryExecutor(InputExecutor):
+    """
+    Discover and list content files from Azure Blob Storage.
+    
+    This executor scans Azure Blob Storage containers to discover content files,
+    creating Content objects for each discovered blob. It supports filtering by
+    prefix, file extensions, traversal depth, and result limits.
+    
+    Configuration (settings dict):
+        - blob_storage_account (str): Azure Blob Storage account name
+          Required: True
+        - blob_storage_credential_type (str): Credential type for blob storage
+          Default: "default_azure_credential"
+          Options: "default_azure_credential", "azure_key_credential"
+        - blob_storage_account_key (str): Storage account key (if using azure_key_credential)
+          Default: None
+        - blob_container_name (str): Container name to scan
+          Required: True
+        - prefix (str): Blob path prefix filter (e.g., "documents/2024/")
+          Default: "" (root)
+        - file_extensions (str): Comma separated list of file extensions to include (e.g., ".pdf,.docx,.txt")
+          Default: "" (all files)
+        - max_depth (int): Maximum folder depth to traverse (0 = unlimited)
+          Default: 0 (unlimited)
+        - max_results (int): Maximum number of blobs to return (0 = unlimited)
+          Default: 0 (unlimited)
+        - include_metadata (bool): Include blob metadata in content data
+          Default: True
+        - sort_by (str): Sort results by field
+          Default: "name"
+          Options: "name", "last_modified", "size"
+        - sort_ascending (bool): Sort in ascending order
+          Default: True
+        - min_size_bytes (int): Minimum file size in bytes (0 = no minimum)
+          Default: 0
+        - max_size_bytes (int): Maximum file size in bytes (0 = no maximum)
+          Default: 0
+        - modified_after (str): Only include files modified after this date (ISO format)
+          Default: None
+        - modified_before (str): Only include files modified before this date (ISO format)
+          Default: None
+        
+        Also setting from BaseExecutor applies.
+    
+    Example:
+        ```yaml
+        - id: blob_input
+          type: azure_blob_input
+          settings:
+            blob_storage_account: "${STORAGE_ACCOUNT}"
+            blob_storage_credential_type: "default_azure_credential"
+            blob_container_name: "documents"
+            prefix: "invoices/2024/"
+            file_extensions: [".pdf", ".docx"]
+            max_depth: 3
+            max_results: 100
+            min_size_bytes: 1024
+            sort_by: "last_modified"
+            sort_ascending: false
+        ```
+    
+    Input:
+        None (this is typically a source/input executor)
+    
+    Output:
+        List[Content] with ContentIdentifier for each discovered blob:
+        - id.canonical_id: Unique blob identifier
+        - id.source_name: "blob"
+        - id.path: Full blob path
+        - data['blob_name']: Blob name
+        - data['blob_path']: Full blob path
+        - data['container_name']: Container name
+        - data['size']: File size in bytes
+        - data['last_modified']: Last modified timestamp
+        - data['content_type']: Content type
+        - data['metadata']: Blob metadata (if include_metadata is True)
+    """
+    
+    def __init__(
+        self,
+        id: str,
+        settings: Optional[Dict[str, Any]] = None,
+        **kwargs
+    ):
+        super().__init__(
+            id=id,
+            settings=settings,
+            **kwargs
+        )
+        
+        # Blob storage configuration
+        self.blob_storage_account = self.get_setting("blob_storage_account", required=True)
+        self.blob_storage_credential_type = self.get_setting(
+            "blob_storage_credential_type", 
+            default="default_azure_credential"
+        )
+        self.blob_storage_account_key = self.get_setting("blob_storage_account_key", default=None)
+        self.blob_container_name = self.get_setting("blob_container_name", required=True)
+        
+        # Filtering and traversal configuration
+        self.prefix = self.get_setting("prefix", default="")
+        self.file_extensions = self.get_setting("file_extensions", default="")
+        self.max_depth = self.get_setting("max_depth", default=0)
+        
+        # Document set discovery support
+        self.discover_mode = self.get_setting("discover_mode", default="files")
+        self.prefix_from_input_field = self.get_setting("prefix_from_input_field", default=None)
+        
+        if self.discover_mode not in ["files", "virtual_folders"]:
+            raise ValueError(
+                f"{self.id}: Invalid discover_mode '{self.discover_mode}'. "
+                f"Must be 'files' or 'virtual_folders'"
+            )
+        
+        # Metadata and sorting
+        self.include_metadata = self.get_setting("include_metadata", default=True)
+        self.sort_by = self.get_setting("sort_by", default="name")
+        self.sort_ascending = self.get_setting("sort_ascending", default=True)
+        
+        # Size filters
+        self.min_size_bytes = self.get_setting("min_size_bytes", default=0)
+        self.max_size_bytes = self.get_setting("max_size_bytes", default=0)
+        
+        # Date filters
+        self.modified_after = self.get_setting("modified_after", default=None)
+        self.modified_before = self.get_setting("modified_before", default=None)
+        
+        # Validate settings
+        if self.sort_by not in ["name", "last_modified", "size"]:
+            raise ValueError(
+                f"{self.id}: Invalid sort_by value: {self.sort_by}. "
+                f"Must be one of: name, last_modified, size"
+            )
+        
+        # Normalize file extensions
+        if self.file_extensions and isinstance(self.file_extensions, str):
+            self.file_extensions = [
+                ext if ext.startswith('.') else f'.{ext}' 
+                for ext in self.file_extensions.split(',')
+            ]
+        
+        # Parse date filters
+        self.modified_after_dt = None
+        self.modified_before_dt = None
+        if self.modified_after:
+            self.modified_after_dt = datetime.fromisoformat(self.modified_after)
+        if self.modified_before:
+            self.modified_before_dt = datetime.fromisoformat(self.modified_before)
+        
+        # Initialize blob connector
+        self.blob_connector = AzureBlobConnector(
+            name="blob_input_connector",
+            settings={
+                "account_name": self.blob_storage_account,
+                "credential_type": self.blob_storage_credential_type,
+                "credential_key": self.blob_storage_account_key
+            }
+        )
+        
+        if self.debug_mode:
+            logger.debug(
+                f"AzureBlobInputExecutor {self.id} initialized: "
+                f"container={self.blob_container_name}, "
+                f"prefix={self.prefix}, "
+                f"extensions={self.file_extensions}, "
+                f"max_depth={self.max_depth}, "
+                f"max_results={self.max_results}"
+            )
+    
+    async def crawl(
+        self,
+        checkpoint_timestamp: Optional[datetime] = None,
+    ) -> AsyncGenerator[tuple[List[Content] | None, Optional[bool] | None], None]:
+        """
+        Crawl Azure Blob Storage and return a batch of Content items.
+        
+        Args:
+            checkpoint_timestamp: Optional timestamp to fetch only blobs modified after this time
+            
+        Returns:
+            Tuple of (List[Content], Optional continuation token)
+        """
+        try:
+            # Initialize blob connector if not already done
+            await self.blob_connector.initialize()
+            
+            logger.debug(
+                    f"Crawling container '{self.blob_container_name}' "
+                    f"with prefix '{self.prefix}', "
+                    f"checkpoint={checkpoint_timestamp}"
+                )
+            
+            # List blobs with pagination support
+            # Note: Azure SDK returns a continuation token for pagination
+            async for blobs in self.blob_connector.list_blobs(container_name=self.blob_container_name,
+                                                                prefix=self.prefix if self.prefix else None,
+                                                                max_results=self.max_results,
+                                                                batch_size=self.batch_size
+                                                             ):
+            
+                blob_list = blobs
+                
+                if self.debug_mode:
+                    logger.debug(f"Found {len(blob_list)} blobs before filtering")
+                
+                if blob_list is None or len(blob_list) == 0:
+                    yield (None, False)
+                
+                # Filter blobs based on checkpoint and other criteria
+                filtered_blobs = self._filter_blobs(
+                    blob_list,
+                    checkpoint_timestamp=checkpoint_timestamp
+                )
+                
+                if self.debug_mode:
+                    logger.debug(f"After filtering: {len(filtered_blobs)} blobs")
+                
+                # Sort blobs
+                sorted_blobs = self._sort_blobs(filtered_blobs)
+                
+                # Create Content objects
+                content_items = []
+                for blob in sorted_blobs:
+                    content = self._create_content_from_blob(blob)
+                    content_items.append(content)
+                
+                yield (content_items, True)
+                
+            yield (None, False)
+            
+        except Exception as e:
+            logger.error(
+                f"Failed to crawl blobs from container '{self.blob_container_name}': {str(e)}",
+                exc_info=True
+            )
+            raise
+    
+    async def process_input(
+        self,
+        input: Union[Content, List[Content]],
+        ctx: WorkflowContext[Union[Content, List[Content]], Union[Content, List[Content]]]
+    ) -> List[Content]:
+        """
+        Discover and list blobs from Azure Blob Storage.
+        
+        This method uses crawl_all() to fetch all content items in batches,
+        respecting the max_results and batch_size settings.
+        
+        Args:
+            input: Ignored for this executor (source executor)
+            ctx: Workflow context
+            
+        Returns:
+            List[Content]: List of Content objects for discovered blobs
+        """
+        start_time = datetime.now()
+        
+        # Dynamic prefix from input content (for document set pipelines)
+        if self.prefix_from_input_field and isinstance(input, Content):
+            dynamic_prefix = self.try_extract_nested_field_from_content(
+                input, self.prefix_from_input_field
+            )
+            if dynamic_prefix:
+                self.prefix = dynamic_prefix
+                if self.debug_mode:
+                    logger.debug(
+                        f"{self.id}: Using dynamic prefix from input: '{self.prefix}'"
+                    )
+        
+        try:
+            # Use crawl_all to fetch all content with automatic pagination
+            content_items = []
+            
+            async for batch, has_more in self.crawl(checkpoint_timestamp=None):
+                
+                if batch is not None and len(batch) > 0:
+                    content_items.extend(batch)
+                    
+                    if self.debug_mode:
+                        logger.debug(
+                            f"Processed batch of {len(batch)} items, "
+                            f"total so far: {len(content_items)}"
+                        )
+            
+                if batch is None and has_more is False:
+                    # No more items
+                    break
+            
+            elapsed = (datetime.now() - start_time).total_seconds()
+            
+            logger.info(
+                f"Discovered {len(content_items)} content items from "
+                f"container '{self.blob_container_name}' in {elapsed:.2f}s"
+            )
+            
+            # Virtual folder discovery mode
+            if self.discover_mode == "virtual_folders":
+                return self._extract_virtual_folders(content_items)
+            
+            return content_items
+            
+        except Exception as e:
+            elapsed = (datetime.now() - start_time).total_seconds()
+            logger.error(
+                f"Failed to list blobs from container '{self.blob_container_name}' "
+                f"after {elapsed:.2f}s: {str(e)}",
+                exc_info=True
+            )
+            raise
+    
+    def _filter_blobs(
+        self,
+        blobs: List[Dict[str, Any]],
+        checkpoint_timestamp: Optional[datetime] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Filter blobs based on configuration and checkpoint.
+        
+        Args:
+            blobs: List of blob metadata dicts
+            checkpoint_timestamp: Optional timestamp to filter blobs modified after this time
+            
+        Returns:
+            Filtered list of blob metadata dicts
+        """
+        filtered = []
+        
+        for blob in blobs:
+            blob_name = blob['name']
+            
+            # Skip if it's a virtual directory marker
+            if blob_name.endswith('/'):
+                logger.debug(f"Skipping virtual directory marker: {blob_name}")
+                continue
+            
+            # Check depth
+            if self.max_depth > 0:
+                # Count directory separators
+                depth = blob_name.count('/')
+                # Adjust for prefix depth
+                prefix_depth = self.prefix.count('/') if self.prefix else 0
+                relative_depth = depth - prefix_depth
+                
+                if relative_depth > self.max_depth:
+                    logger.debug(
+                        f"Skipping blob '{blob_name}' due to depth {relative_depth} "
+                        f"exceeding max_depth {self.max_depth}"
+                    )
+                    continue
+            
+            # Check file extension
+            if self.file_extensions:
+                blob_ext = Path(blob_name).suffix.lower()
+                if blob_ext not in [ext.lower() for ext in self.file_extensions]:
+                    logger.debug(f"Skipping blob '{blob_name}' due to unsupported file extension '{blob_ext}'. Supported extensions: {self.file_extensions}")
+                    continue
+            
+            # Check size filters
+            blob_size = blob.get('size', 0)
+            if self.min_size_bytes > 0 and blob_size < self.min_size_bytes:
+                logger.debug(f"Skipping blob '{blob_name}' due to size {blob_size} bytes being smaller than min_size_bytes {self.min_size_bytes}")
+                continue
+            if self.max_size_bytes > 0 and blob_size > self.max_size_bytes:
+                logger.debug(f"Skipping blob '{blob_name}' due to size {blob_size} bytes being larger than max_size_bytes {self.max_size_bytes}")
+                continue
+            
+            # Check date filters
+            last_modified = blob.get('last_modified')
+            if last_modified:
+                # Ensure timezone-aware comparison
+                if last_modified.tzinfo is None:
+                    # If blob timestamp is naive, make it timezone-aware (UTC)
+                    from datetime import timezone
+                    last_modified = last_modified.replace(tzinfo=timezone.utc)
+                
+                # Check checkpoint timestamp (incremental crawling)
+                if checkpoint_timestamp:
+                    checkpoint = checkpoint_timestamp
+                    if checkpoint.tzinfo is None:
+                        from datetime import timezone
+                        checkpoint = checkpoint.replace(tzinfo=timezone.utc)
+                    
+                    if last_modified <= checkpoint:
+                        logger.debug(f"Skipping blob '{blob_name}' due to last_modified {last_modified} being older than or equal to checkpoint {checkpoint}")
+                        continue
+                
+                if self.modified_after_dt:
+                    # Make filter timezone-aware if needed
+                    modified_after = self.modified_after_dt
+                    if modified_after.tzinfo is None:
+                        from datetime import timezone
+                        modified_after = modified_after.replace(tzinfo=timezone.utc)
+                    
+                    if last_modified < modified_after:
+                        logger.debug(f"Skipping blob '{blob_name}' due to last_modified {last_modified} being earlier than modified_after {modified_after}")
+                        continue
+                
+                if self.modified_before_dt:
+                    # Make filter timezone-aware if needed
+                    modified_before = self.modified_before_dt
+                    if modified_before.tzinfo is None:
+                        from datetime import timezone
+                        modified_before = modified_before.replace(tzinfo=timezone.utc)
+                    
+                    if last_modified > modified_before:
+                        logger.debug(f"Skipping blob '{blob_name}' due to last_modified {last_modified} being later than modified_before {modified_before}")
+                        continue
+            
+            filtered.append(blob)
+        
+        return filtered
+    
+    def _sort_blobs(self, blobs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Sort blobs based on configuration.
+        
+        Args:
+            blobs: List of blob metadata dicts
+            
+        Returns:
+            Sorted list of blob metadata dicts
+        """
+        if self.sort_by == "name":
+            key_func = lambda b: b['name']
+        elif self.sort_by == "last_modified":
+            key_func = lambda b: b.get('last_modified', datetime.min)
+        elif self.sort_by == "size":
+            key_func = lambda b: b.get('size', 0)
+        else:
+            key_func = lambda b: b['name']
+        
+        return sorted(blobs, key=key_func, reverse=not self.sort_ascending)
+    
+    def _create_content_from_blob(self, blob: Dict[str, Any]) -> Content:
+        """
+        Create a Content object from blob metadata.
+        
+        Args:
+            blob: Blob metadata dict
+            
+        Returns:
+            Content object
+        """
+        blob_name = blob['name']
+        filename = blob_name.split('/')[-1] if '/' in blob_name else blob_name
+        
+        # Generate unique ID
+        unique_id = self.generate_sha1_hash(
+            f"{self.blob_storage_account}/{self.blob_container_name}/{blob_name}"
+        )
+        
+        # Create ContentIdentifier
+        identifier = ContentIdentifier(
+            canonical_id=f"https://{self.blob_storage_account}.blob.core.windows.net/{self.blob_container_name}/{blob_name}",
+            unique_id=unique_id,
+            source_name=self.blob_storage_account,
+            source_type="azure_blob",
+            container=self.blob_container_name,
+            path=blob_name,
+            filename=filename
+        )
+        
+        # Build content metadata
+        metadata = {
+            'size': blob.get('size', 0),
+            'last_modified': blob.get('last_modified'),
+            'content_type': blob.get('content_type'),
+        }
+        
+        # Include metadata if requested
+        if self.include_metadata and blob.get('metadata'):
+            metadata['blob_metadata'] = blob['metadata']
+        
+        # add as metadata to the identifier
+        identifier.metadata = metadata
+        
+        # Create Content object
+        content = Content(
+            id=identifier,
+            data={}
+        )
+        
+        # Add executor log entry
+        content.executor_logs.append(ExecutorLogEntry(
+            executor_id=self.id,
+            start_time=datetime.now(),
+            end_time=datetime.now(),
+            status="completed",
+            details={
+                'blob_discovered': blob_name,
+                'container': self.blob_container_name
+            },
+            errors=[]
+        ))
+        
+        return content
+    
+    def _extract_virtual_folders(self, content_items: List[Content]) -> List[Content]:
+        """
+        Extract unique immediate subfolders from discovered blobs.
+        
+        Groups discovered blobs by their immediate subfolder under the
+        configured prefix, returning one Content item per unique subfolder.
+        
+        Args:
+            content_items: List of discovered Content items (one per blob)
+            
+        Returns:
+            List[Content] — one per unique immediate subfolder, with:
+            - id.path: the subfolder prefix
+            - id.filename: the folder name
+            - data["folder_prefix"]: full prefix for the subfolder
+            - data["folder_name"]: folder name
+            - data["file_count"]: number of blobs in the subfolder
+            - data["container_name"]: container name
+        """
+        prefix = self.prefix or ""
+        folder_set: Dict[str, Dict[str, Any]] = {}
+        
+        for content in content_items:
+            blob_path = content.id.path or ""
+            
+            # Get relative path after prefix
+            if prefix and blob_path.startswith(prefix):
+                relative = blob_path[len(prefix):]
+            else:
+                relative = blob_path
+            
+            parts = relative.split("/")
+            if len(parts) > 1:
+                # Has a subfolder
+                folder_name = parts[0]
+                folder_prefix = f"{prefix}{folder_name}/"
+                if folder_prefix not in folder_set:
+                    folder_set[folder_prefix] = {
+                        "name": folder_name,
+                        "count": 0
+                    }
+                folder_set[folder_prefix]["count"] += 1
+        
+        # Create one Content per subfolder
+        result_items = []
+        for folder_prefix, info in sorted(folder_set.items()):
+            folder_content = Content(
+                id=ContentIdentifier(
+                    canonical_id=f"folder://{self.blob_container_name}/{folder_prefix}",
+                    unique_id=self.generate_sha1_hash(
+                        f"{self.blob_storage_account}/{self.blob_container_name}/{folder_prefix}"
+                    ),
+                    source_name=self.blob_storage_account,
+                    source_type="azure_blob_folder",
+                    container=self.blob_container_name,
+                    path=folder_prefix,
+                    filename=info["name"],
+                ),
+                data={
+                    "folder_prefix": folder_prefix,
+                    "folder_name": info["name"],
+                    "file_count": info["count"],
+                    "container_name": self.blob_container_name,
+                },
+            )
+            
+            # Add executor log entry
+            folder_content.executor_logs.append(ExecutorLogEntry(
+                executor_id=self.id,
+                start_time=datetime.now(),
+                end_time=datetime.now(),
+                status="completed",
+                details={
+                    "folder_discovered": folder_prefix,
+                    "file_count": info["count"],
+                    "container": self.blob_container_name,
+                },
+                errors=[]
+            ))
+            
+            result_items.append(folder_content)
+        
+        logger.info(
+            f"{self.id}: Discovered {len(result_items)} virtual folders "
+            f"under prefix '{prefix}'"
+        )
+        
+        return result_items

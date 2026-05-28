@@ -1,0 +1,13 @@
+# Sample ContentFlow pipeline YAML for ASG Registros Document Validation
+pipeline:
+  id: validate_registros_case
+  name: "Validate ASG Registros Case"
+  description: "Pipeline to validate a single ASG Registros case using AI."
+  version: "1.0"
+  steps:
+    - id: validate_case
+      name: "Validate Case"
+      executor: registro_validation
+      settings:
+        tramite_guid: "3456413e-0975-4e43-9d6a-9344b674c9ca"  # <-- Replace with your actual tramiteGuid
+        output_path: "validation_results.json"  # Optional, default is validation_results.json

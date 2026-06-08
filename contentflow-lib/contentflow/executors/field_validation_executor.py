@@ -29,24 +29,49 @@ class FieldValidationExecutor(BaseExecutor):
     # Optional documents - validated but non-determinative for final verdict
     OPTIONAL_DOC_INDICES = {2}  # _02 = Resolucion Corporativa
 
-    # Per-document fields to validate — only these fields are compared against API.
-    # Fields not listed are skipped with status="not_required".
-    # If a doc index is not in this map, ALL fields are validated (legacy behavior).
+    # Filename patterns for excluded/optional/member-verification documents
+    EXCLUDED_FILENAME_PATTERNS = [r"Company.Profile", r"Declaracion.Jurada"]
+    OPTIONAL_FILENAME_PATTERNS = [r"Resolucion.Corporativa"]
+    MEMBER_VERIFICATION_FILENAME_PATTERNS = [r"Antecedentes.*Penales|Policia|Policía"]
+
+    # Filename-based validation field mapping (case-insensitive regex → fields to validate)
+    # Order matters: first match wins
+    VALIDATION_FIELDS_BY_FILENAME = [
+        (r"Company.Profile|Declaracion.Jurada",           None),  # excluded
+        (r"Resolucion.Corporativa",                        {"company_name"}),
+        (r"SAM|Entity.*Information.*SAM",                   {"company_name", "unique_entity_id"}),
+        (r"Antecedentes.*Penales|Policia|Policía",         {"company_name", "ssn_last_four"}),
+        (r"SC-6088|Radicacion.*Planillas.*Ingresos",       {"company_name", "ein_ssn"}),
+        (r"SC-6096|HACIENDA.*Deuda|Deuda.*HACIENDA",       {"company_name", "ein_ssn"}),
+        (r"SC-2942|IVU|Planillas.*IVU",                    {"company_name", "ein_ssn"}),
+        (r"Registro.*Comerciante|Merchant",                {"company_name", "ein_ssn", "merchant_registration"}),
+        (r"HACIENDA",                                      {"company_name", "ein_ssn"}),
+        (r"Desempleo|Incapacidad|DTRH.*Seguro",            {"company_name", "ein_ssn"}),
+        (r"Choferil",                                      {"company_name", "ein_ssn"}),
+        (r"DTRH",                                          {"company_name", "ein_ssn"}),
+        (r"CFSE|Fondo.*Seguro.*Estado",                    {"company_name", "ein_ssn"}),
+        (r"ASUME",                                         {"company_name"}),
+        (r"CRIM",                                          {"company_name"}),
+        (r"Incorporacion",                                 {"company_name"}),
+        (r"Existencia|Good.Standing|ESTADO",               {"company_name"}),
+    ]
+
+    # Legacy per-index mapping (fallback if filename doesn't match)
     VALIDATION_FIELDS_PER_DOC = {
-        2:  {"company_name"},                               # _02 Corporate Resolution (optional)
-        3:  {"company_name", "unique_entity_id"},           # _03 SAM.gov
-        4:  {"company_name", "ssn_last_four"},              # _04 Policía (+ member verification)
-        7:  {"company_name", "ein_ssn"},                    # _07 Hacienda Planilla SC-6088
-        8:  {"company_name", "ein_ssn"},                    # _08 Hacienda Deuda SC-6096
-        9:  {"company_name", "ein_ssn"},                    # _09 Hacienda IVU SC-2942
-        10: {"company_name", "ein_ssn"},                    # _10 DTRH Desempleo/Incapacidad
-        11: {"company_name", "ein_ssn"},                    # _11 DTRH Choferil
-        12: {"company_name"},                               # _12 CRIM Deuda
-        14: {"company_name"},                               # _14 ASUME Propiedad Mueble
+        2:  {"company_name"},
+        3:  {"company_name", "unique_entity_id"},
+        4:  {"company_name", "ssn_last_four"},
+        7:  {"company_name", "ein_ssn"},
+        8:  {"company_name", "ein_ssn"},
+        9:  {"company_name", "ein_ssn"},
+        10: {"company_name", "ein_ssn"},
+        11: {"company_name", "ein_ssn"},
+        12: {"company_name"},
+        14: {"company_name"},
     }
 
     # Documents that require authorized member verification
-    MEMBER_VERIFICATION_DOC_INDICES = {4}  # Only _04 Policía
+    MEMBER_VERIFICATION_DOC_INDICES = {4}  # Legacy fallback
 
     # Table-extracted field aliases that map to standard fields
     TABLE_FIELD_ALIASES = {
@@ -162,6 +187,41 @@ class FieldValidationExecutor(BaseExecutor):
         canonical_id = getattr(content.id, 'canonical_id', '') or ''
         m = re.search(r'_(\d+)$', canonical_id)
         return int(m.group(1)) if m else -1
+
+    def _get_filename(self, content) -> str:
+        """Get filename from content for classification."""
+        filename = getattr(content.id, 'filename', '') or ''
+        if not filename:
+            filename = getattr(content.id, 'canonical_id', '') or ''
+        return filename
+
+    def _is_excluded_by_filename(self, filename: str) -> bool:
+        """Check if document should be excluded based on filename."""
+        for pattern in self.EXCLUDED_FILENAME_PATTERNS:
+            if re.search(pattern, filename, re.IGNORECASE):
+                return True
+        return False
+
+    def _is_optional_by_filename(self, filename: str) -> bool:
+        """Check if document is optional based on filename."""
+        for pattern in self.OPTIONAL_FILENAME_PATTERNS:
+            if re.search(pattern, filename, re.IGNORECASE):
+                return True
+        return False
+
+    def _needs_member_verification(self, filename: str, doc_index: int) -> bool:
+        """Check if document needs member verification based on filename."""
+        for pattern in self.MEMBER_VERIFICATION_FILENAME_PATTERNS:
+            if re.search(pattern, filename, re.IGNORECASE):
+                return True
+        return doc_index in self.MEMBER_VERIFICATION_DOC_INDICES
+
+    def _get_validation_fields_by_filename(self, filename: str) -> set:
+        """Determine which fields to validate based on filename patterns."""
+        for pattern, fields in self.VALIDATION_FIELDS_BY_FILENAME:
+            if re.search(pattern, filename, re.IGNORECASE):
+                return fields  # None means excluded
+        return None  # No match — validate all fields (legacy behavior)
 
     def _resolve_table_aliases(self, extracted: dict) -> dict:
         """Resolve table-extracted keys to standard field names when standard field is empty/bad."""
@@ -299,8 +359,10 @@ class FieldValidationExecutor(BaseExecutor):
         doc_index = self._get_doc_index(content)
 
         # ── Check if document is EXCLUDED from validation ──
-        if doc_index in self.EXCLUDED_DOC_INDICES:
-            logger.info(f"Document {canonical_id} (index {doc_index}) is EXCLUDED from validation.")
+        filename = self._get_filename(content)
+        is_excluded = self._is_excluded_by_filename(filename) or doc_index in self.EXCLUDED_DOC_INDICES
+        if is_excluded:
+            logger.info(f"Document {canonical_id} ('{filename}') is EXCLUDED from validation.")
             validation_result = {
                 "status": "excluded",
                 "reason": "Document designated for exclusion from validation process.",
@@ -317,11 +379,15 @@ class FieldValidationExecutor(BaseExecutor):
 
         if not extracted:
             logger.info(f"No extracted fields for {canonical_id} - skipping validation")
-            content.data["validation_result"] = {
+            validation_result = {
                 "status": "skipped",
                 "reason": "no_extracted_fields",
                 "field_count": 0,
+                "rejectReasons": [],
             }
+            content.data["validation_result"] = validation_result
+            await self._upload_validation_report(content, validation_result)
+            self._save_local(content, validation_result)
             return content
 
         # ── Resolve table-extracted aliases to standard field names ──
@@ -333,7 +399,10 @@ class FieldValidationExecutor(BaseExecutor):
             extracted["ssn_last_four"] = ssn_last_four
 
         # ── Determine which fields to validate for this document type ──
-        allowed_fields = self.VALIDATION_FIELDS_PER_DOC.get(doc_index)
+        allowed_fields = self._get_validation_fields_by_filename(filename)
+        if allowed_fields is None:
+            allowed_fields = self.VALIDATION_FIELDS_PER_DOC.get(doc_index)
+        logger.info(f"Validation fields for '{filename}' (idx {doc_index}): {allowed_fields}")
 
         results = {}
         matched = 0
@@ -472,10 +541,10 @@ class FieldValidationExecutor(BaseExecutor):
         validation_score = round(matched / total_compared, 3) if total_compared > 0 else 0.0
 
         # Generate reject reasons based on mismatches and validation issues
-        reject_reasons = self._generate_reject_reasons(results, extracted, api_data)
+        reject_reasons = self._generate_reject_reasons(results, extracted, api_data, filename)
 
-        # ── Member Verification (only for _04 Policía) ──
-        is_member_verification_doc = doc_index in self.MEMBER_VERIFICATION_DOC_INDICES
+        # ── Member Verification (for Policía documents) ──
+        is_member_verification_doc = self._needs_member_verification(filename, doc_index)
         if is_member_verification_doc:
             member_reasons = self._verify_authorized_members(extracted, api_data, content)
             member_reason_id = len(reject_reasons) + 1
@@ -484,7 +553,7 @@ class FieldValidationExecutor(BaseExecutor):
                 reject_reasons.append(mr)
                 member_reason_id += 1
         # ── Determine if document is optional ──
-        is_optional = doc_index in self.OPTIONAL_DOC_INDICES
+        is_optional = self._is_optional_by_filename(filename) or doc_index in self.OPTIONAL_DOC_INDICES
 
         validation_result = {
             "status": "validated",
@@ -526,7 +595,7 @@ class FieldValidationExecutor(BaseExecutor):
 
         return content
 
-    def _generate_reject_reasons(self, field_results: dict, extracted: dict, api_data: dict) -> list:
+    def _generate_reject_reasons(self, field_results: dict, extracted: dict, api_data: dict, filename: str = "") -> list:
         """
         Generate reject reasons based on field comparison results.
         Each reason has an id and a descriptive reason string.
@@ -577,7 +646,23 @@ class FieldValidationExecutor(BaseExecutor):
 
         # ── Date Validation (3-step logic) ──────────────────────────────
         # Step 1: Try to parse expiration_date and issue_date
-        validity_window_days = 90
+        # Per-document validity windows (days) when no expiration date is present
+        VALIDITY_WINDOWS = [
+            (r"SC-2942|IVU|Planillas.*IVU", 30),
+            (r"SC-6088|Radicacion.*Planillas.*Ingresos", 30),
+            (r"SC-6096|HACIENDA.*Deuda|Deuda.*HACIENDA", 30),
+            (r"CRIM", 90),
+            (r"DTRH", 90),
+            (r"CFSE|Fondo.*Seguro", 90),
+            (r"ASUME", 90),
+            (r"SAM", 90),
+        ]
+        validity_window_days = 90  # default
+        for pattern, days in VALIDITY_WINDOWS:
+            if re.search(pattern, filename, re.IGNORECASE):
+                validity_window_days = days
+                break
+        logger.info(f"Date validity window for '{filename}': {validity_window_days} days")
         now = datetime.now()
 
         # Spanish month name mapping
@@ -637,12 +722,12 @@ class FieldValidationExecutor(BaseExecutor):
                 })
                 reason_id += 1
         elif issue_date:
-            # Step 2 – No expiration, but issue date found → 90-day window
+            # Step 2 – No expiration, but issue date found → validity window check
             days_elapsed = (now - issue_date).days
             if days_elapsed > validity_window_days:
                 reasons.append({
                     "id": reason_id,
-                    "reason": "Your certificate is not current. Please request it again."
+                    "reason": f"Your certification is not current. Please request it again. It must be less than {validity_window_days} days since issuance. (Issued: {issue_raw}, {days_elapsed} days ago)"
                 })
                 reason_id += 1
         else:
@@ -753,12 +838,34 @@ class FieldValidationExecutor(BaseExecutor):
                 "error": str(e),
             }
 
+    async def _safe_process(self, content):
+        """Wrap process_content_item so crashes always produce a validation report."""
+        try:
+            return await self.process_content_item(content)
+        except Exception as e:
+            import traceback
+            canonical_id = getattr(content.id, 'canonical_id', 'unknown')
+            logger.error(f"FIELD VALIDATION CRASHED for {canonical_id}: {type(e).__name__}: {e}")
+            logger.error(f"Traceback:\n{traceback.format_exc()}")
+            validation_result = {
+                "status": "error",
+                "reason": f"Validation processing error: {type(e).__name__}: {e}",
+                "rejectReasons": [],
+            }
+            content.data["validation_result"] = validation_result
+            try:
+                await self._upload_validation_report(content, validation_result)
+                self._save_local(content, validation_result)
+            except Exception as upload_err:
+                logger.error(f"Failed to upload error report for {canonical_id}: {upload_err}")
+            return content
+
     async def process_input(
         self,
         input: Union['Content', List['Content']],
         ctx: WorkflowContext[Union['Content', List['Content']], Union['Content', List['Content']]]
     ) -> Union['Content', List['Content']]:
         if isinstance(input, list):
-            return [await self.process_content_item(item) for item in input]
+            return [await self._safe_process(item) for item in input]
         else:
-            return await self.process_content_item(input)
+            return await self._safe_process(input)

@@ -55,11 +55,14 @@ class APIFetchExecutor(InputExecutor):
             "ApiKey": self.api_key
         }
         try:
-            resp = requests.post(auth_url, json=payload)
+            resp = requests.post(auth_url, json=payload, verify=False)
+            logger.info(f"Auth response status: {resp.status_code}")
+            logger.info(f"Auth response body: {resp.text[:500]}")
             resp.raise_for_status()
-            token = resp.json().get("token")
+            resp_json = resp.json()
+            token = resp_json.get("accessToken") or resp_json.get("token") or resp_json.get("Token") or resp_json.get("access_token")
             if not token:
-                logger.error("Authentication failed: No token returned.")
+                logger.error(f"Authentication failed: No token in response. Keys: {list(resp_json.keys())}")
                 raise RuntimeError("Authentication failed: No token returned.")
             return token
         except Exception as e:

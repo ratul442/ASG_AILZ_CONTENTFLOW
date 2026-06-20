@@ -29,24 +29,49 @@ class FieldValidationExecutor(BaseExecutor):
     # Optional documents - validated but non-determinative for final verdict
     OPTIONAL_DOC_INDICES = {2}  # _02 = Resolucion Corporativa
 
-    # Per-document fields to validate — only these fields are compared against API.
-    # Fields not listed are skipped with status="not_required".
-    # If a doc index is not in this map, ALL fields are validated (legacy behavior).
+    # Filename patterns for excluded/optional/member-verification documents
+    EXCLUDED_FILENAME_PATTERNS = [r"Company.Profile", r"Declaracion.Jurada"]
+    OPTIONAL_FILENAME_PATTERNS = [r"Resolucion.Corporativa"]
+    MEMBER_VERIFICATION_FILENAME_PATTERNS = [r"Antecedentes.*Penales|Policia|Policía"]
+
+    # Filename-based validation field mapping (case-insensitive regex → fields to validate)
+    # Order matters: first match wins
+    VALIDATION_FIELDS_BY_FILENAME = [
+        (r"Company.Profile|Declaracion.Jurada",           None),  # excluded
+        (r"Resolucion.Corporativa",                        {"company_name"}),
+        (r"SAM|Entity.*Information.*SAM",                   {"company_name", "unique_entity_id", "expiration_date"}),
+        (r"Antecedentes.*Penales|Policia|Policía",         {"ssn_last_four"}),  # personal cert — no company_name
+        (r"SC-6088|Radicacion.*Planillas.*Ingresos",       {"company_name", "ein_ssn", "issue_date"}),
+        (r"SC-6096|HACIENDA.*Deuda|Deuda.*HACIENDA",       {"company_name", "ein_ssn", "issue_date"}),
+        (r"SC-2942|SC-2918|IVU|Planillas.*IVU",            {"company_name", "ein_ssn", "merchant_registration", "expiration_date", "naics_code", "agent_type"}),
+        (r"Registro.*Comerciante|Merchant",                {"company_name", "ein_ssn", "merchant_registration", "expiration_date", "naics_code", "agent_type"}),
+        (r"HACIENDA",                                      {"company_name", "ein_ssn", "issue_date"}),
+        (r"Desempleo|Incapacidad|DTRH.*Seguro",            {"company_name", "ein_ssn", "issue_date"}),
+        (r"Choferil",                                      {"company_name", "ein_ssn", "issue_date"}),
+        (r"DTRH",                                          {"company_name", "ein_ssn", "issue_date"}),
+        (r"CFSE|Fondo.*Seguro.*Estado",                    {"company_name", "ein_ssn", "ssn_last_four", "expiration_date"}),
+        (r"ASUME",                                         {"company_name", "ein_ssn", "issue_date"}),
+        (r"CRIM",                                          {"company_name", "ein_ssn", "expiration_date"}),
+        (r"Incorporacion",                                 {"company_name", "registration_number"}),
+        (r"Existencia|Good.Standing|ESTADO",               {"company_name", "registration_number"}),
+    ]
+
+    # Legacy per-index mapping (fallback if filename doesn't match)
     VALIDATION_FIELDS_PER_DOC = {
-        2:  {"company_name"},                               # _02 Corporate Resolution (optional)
-        3:  {"company_name", "unique_entity_id"},           # _03 SAM.gov
-        4:  {"company_name", "ssn_last_four"},              # _04 Policía (+ member verification)
-        7:  {"company_name", "ein_ssn"},                    # _07 Hacienda Planilla SC-6088
-        8:  {"company_name", "ein_ssn"},                    # _08 Hacienda Deuda SC-6096
-        9:  {"company_name", "ein_ssn"},                    # _09 Hacienda IVU SC-2942
-        10: {"company_name", "ein_ssn"},                    # _10 DTRH Desempleo/Incapacidad
-        11: {"company_name", "ein_ssn"},                    # _11 DTRH Choferil
-        12: {"company_name"},                               # _12 CRIM Deuda
-        14: {"company_name"},                               # _14 ASUME Propiedad Mueble
+        2:  {"company_name"},
+        3:  {"company_name", "unique_entity_id"},
+        4:  {"company_name", "ssn_last_four"},
+        7:  {"company_name", "ein_ssn"},
+        8:  {"company_name", "ein_ssn"},
+        9:  {"company_name", "ein_ssn"},
+        10: {"company_name", "ein_ssn"},
+        11: {"company_name", "ein_ssn"},
+        12: {"company_name"},
+        14: {"company_name"},
     }
 
     # Documents that require authorized member verification
-    MEMBER_VERIFICATION_DOC_INDICES = {4}  # Only _04 Policía
+    MEMBER_VERIFICATION_DOC_INDICES = {4}  # Legacy fallback
 
     # Table-extracted field aliases that map to standard fields
     TABLE_FIELD_ALIASES = {
@@ -87,11 +112,13 @@ class FieldValidationExecutor(BaseExecutor):
         "naics_code": ["naicsCodes"],
         "total_amount": [],
         "date": [],
-        "expiration_date": [],
-        "issue_date": [],
+        "expiration_date": [],   # validated via date logic in _generate_reject_reasons, not field comparison
+        "issue_date": [],        # validated via date logic in _generate_reject_reasons, not field comparison
         "document_title": [],
         "agent_type": ["agentType"],
         "unique_entity_id": ["uniqueEntityId", "samEntityId"],
+        "debt_status": [],       # validated via debt logic in _generate_reject_reasons
+        "compliance_status": [], # validated via ASUME compliance logic
     }
 
     def __init__(self, id: str, settings=None, **kwargs):
@@ -163,6 +190,41 @@ class FieldValidationExecutor(BaseExecutor):
         m = re.search(r'_(\d+)$', canonical_id)
         return int(m.group(1)) if m else -1
 
+    def _get_filename(self, content) -> str:
+        """Get filename from content for classification."""
+        filename = getattr(content.id, 'filename', '') or ''
+        if not filename:
+            filename = getattr(content.id, 'canonical_id', '') or ''
+        return filename
+
+    def _is_excluded_by_filename(self, filename: str) -> bool:
+        """Check if document should be excluded based on filename."""
+        for pattern in self.EXCLUDED_FILENAME_PATTERNS:
+            if re.search(pattern, filename, re.IGNORECASE):
+                return True
+        return False
+
+    def _is_optional_by_filename(self, filename: str) -> bool:
+        """Check if document is optional based on filename."""
+        for pattern in self.OPTIONAL_FILENAME_PATTERNS:
+            if re.search(pattern, filename, re.IGNORECASE):
+                return True
+        return False
+
+    def _needs_member_verification(self, filename: str, doc_index: int) -> bool:
+        """Check if document needs member verification based on filename."""
+        for pattern in self.MEMBER_VERIFICATION_FILENAME_PATTERNS:
+            if re.search(pattern, filename, re.IGNORECASE):
+                return True
+        return doc_index in self.MEMBER_VERIFICATION_DOC_INDICES
+
+    def _get_validation_fields_by_filename(self, filename: str) -> set:
+        """Determine which fields to validate based on filename patterns."""
+        for pattern, fields in self.VALIDATION_FIELDS_BY_FILENAME:
+            if re.search(pattern, filename, re.IGNORECASE):
+                return fields  # None means excluded
+        return None  # No match — validate all fields (legacy behavior)
+
     def _resolve_table_aliases(self, extracted: dict) -> dict:
         """Resolve table-extracted keys to standard field names when standard field is empty/bad."""
         resolved = dict(extracted)
@@ -210,7 +272,14 @@ class FieldValidationExecutor(BaseExecutor):
         return []
 
     def _verify_authorized_members(self, extracted: dict, api_data: dict, content=None) -> list:
-        """For CRIM certs, verify ALL authorized member names from API appear in document."""
+        """
+        For Policía (Antecedentes Penales) documents, verify the person named
+        in this certificate is one of the authorized members from the API.
+        
+        NOTE: Each authorized member gets their OWN separate certificate.
+        We do NOT require all members to appear in one document.
+        Instead, we check: "Is the person on THIS certificate an authorized member?"
+        """
         reasons = []
         members = self._find_authorized_members(api_data)
         if not members:
@@ -218,11 +287,10 @@ class FieldValidationExecutor(BaseExecutor):
             logger.info(f"API data top-level keys: {list(api_data.keys()) if isinstance(api_data, dict) else type(api_data)}")
             return reasons
 
-        # Build searchable text from extracted fields
+        # Build searchable text from extracted fields + raw DI output
         all_text = " ".join(str(v) for v in extracted.values() if isinstance(v, str)).lower()
         all_text += " " + " ".join(str(k) for k in extracted.keys()).lower()
 
-        # Also search the original Document Intelligence text (raw OCR output)
         if content is not None:
             di_output = (
                 content.data.get("doc_intell_output")
@@ -241,8 +309,8 @@ class FieldValidationExecutor(BaseExecutor):
 
         all_text_normalized = strip_accents(all_text)
 
+        # Check which authorized members are found in THIS document
         member_details = []
-        missing_members = []
         found_members = []
         for member in members:
             if isinstance(member, dict):
@@ -272,7 +340,7 @@ class FieldValidationExecutor(BaseExecutor):
             detail = {
                 "name": member_name,
                 "position": position,
-                "status": "match" if found else "unmatch",
+                "status": "match" if found else "not_in_this_doc",
                 "matched_parts": matched_parts,
                 "unmatched_parts": [p for p in name_parts if p not in matched_parts],
             }
@@ -280,16 +348,17 @@ class FieldValidationExecutor(BaseExecutor):
 
             if found:
                 found_members.append(member_name)
-            else:
-                missing_members.append(member_name)
 
-        logger.info(f"Member verification: found={found_members}, missing={missing_members}")
+        logger.info(f"Member verification (per-doc): found_in_this_doc={found_members}, total_authorized={len(members)}")
         self._last_member_details = member_details
 
-        if missing_members:
+        # Per-document logic: THIS certificate must belong to at least one authorized member
+        if not found_members:
             reasons.append({
                 "id": 900,
-                "reason": f"Authorized member(s) not found in document: {', '.join(missing_members)}. All authorized members must be verified."
+                "RejectionReasonId": self.REJECTION_REASON_IDS["member_not_found"],
+                "reason": "The person named in this certificate does not match any authorized company member. "
+                          "The certificate must belong to an authorized member."
             })
         return reasons
 
@@ -299,8 +368,10 @@ class FieldValidationExecutor(BaseExecutor):
         doc_index = self._get_doc_index(content)
 
         # ── Check if document is EXCLUDED from validation ──
-        if doc_index in self.EXCLUDED_DOC_INDICES:
-            logger.info(f"Document {canonical_id} (index {doc_index}) is EXCLUDED from validation.")
+        filename = self._get_filename(content)
+        is_excluded = self._is_excluded_by_filename(filename) or doc_index in self.EXCLUDED_DOC_INDICES
+        if is_excluded:
+            logger.info(f"Document {canonical_id} ('{filename}') is EXCLUDED from validation.")
             validation_result = {
                 "status": "excluded",
                 "reason": "Document designated for exclusion from validation process.",
@@ -317,11 +388,15 @@ class FieldValidationExecutor(BaseExecutor):
 
         if not extracted:
             logger.info(f"No extracted fields for {canonical_id} - skipping validation")
-            content.data["validation_result"] = {
+            validation_result = {
                 "status": "skipped",
                 "reason": "no_extracted_fields",
                 "field_count": 0,
+                "rejectReasons": [],
             }
+            content.data["validation_result"] = validation_result
+            await self._upload_validation_report(content, validation_result)
+            self._save_local(content, validation_result)
             return content
 
         # ── Resolve table-extracted aliases to standard field names ──
@@ -333,7 +408,10 @@ class FieldValidationExecutor(BaseExecutor):
             extracted["ssn_last_four"] = ssn_last_four
 
         # ── Determine which fields to validate for this document type ──
-        allowed_fields = self.VALIDATION_FIELDS_PER_DOC.get(doc_index)
+        allowed_fields = self._get_validation_fields_by_filename(filename)
+        if allowed_fields is None:
+            allowed_fields = self.VALIDATION_FIELDS_PER_DOC.get(doc_index)
+        logger.info(f"Validation fields for '{filename}' (idx {doc_index}): {allowed_fields}")
 
         results = {}
         matched = 0
@@ -471,11 +549,94 @@ class FieldValidationExecutor(BaseExecutor):
         total_compared = matched + mismatched
         validation_score = round(matched / total_compared, 3) if total_compared > 0 else 0.0
 
-        # Generate reject reasons based on mismatches and validation issues
-        reject_reasons = self._generate_reject_reasons(results, extracted, api_data)
+        # ── Date Execution Window Check (add result to field_results) ──
+        from datetime import datetime as _dt
+        _now = _dt.now()
+        expiration_raw = extracted.get("expiration_date", "")
+        issue_raw = extracted.get("issue_date", "") or extracted.get("date", "")
 
-        # ── Member Verification (only for _04 Policía) ──
-        is_member_verification_doc = doc_index in self.MEMBER_VERIFICATION_DOC_INDICES
+        # Reuse the date parsing logic from _generate_reject_reasons
+        SPANISH_MONTHS_QUICK = {
+            "enero": "01", "febrero": "02", "marzo": "03", "abril": "04",
+            "mayo": "05", "junio": "06", "julio": "07", "agosto": "08",
+            "septiembre": "09", "octubre": "10", "noviembre": "11", "diciembre": "12",
+            "ene": "01", "feb": "02", "mar": "03", "abr": "04",
+            "may": "05", "jun": "06", "jul": "07", "ago": "08",
+            "sep": "09", "oct": "10", "nov": "11", "dic": "12",
+        }
+        def _quick_parse_date(raw):
+            if not raw:
+                return None
+            raw = raw.strip()
+            normalized = re.sub(r'\bde\b', '', raw, flags=re.IGNORECASE).strip()
+            normalized = re.sub(r'\s+', ' ', normalized)
+            for sp, num in SPANISH_MONTHS_QUICK.items():
+                pat = re.compile(re.escape(sp), re.IGNORECASE)
+                if pat.search(normalized):
+                    normalized = pat.sub(num, normalized)
+                    break
+            # Strip dots from abbreviated months (e.g., "15-Aug.-2026" → "15-Aug-2026")
+            normalized = re.sub(r'(\w{3})\.-', r'\1-', normalized)
+            normalized = re.sub(r'\.(\d{4})', r'-\1', normalized)
+            for fmt in ("%d/%m/%Y", "%m/%d/%Y", "%d-%m-%Y", "%Y-%m-%d", "%d %m %Y",
+                        "%d %B %Y", "%d %b %Y", "%B %d, %Y", "%b %d, %Y",
+                        "%d-%b-%Y", "%d-%B-%Y", "%m/%d/%y", "%d/%m/%y",
+                        "%d-%b.-%Y"):
+                try:
+                    return _dt.strptime(normalized.strip(), fmt)
+                except ValueError:
+                    continue
+            return None
+
+        _exp_date = _quick_parse_date(expiration_raw)
+        _issue_date = _quick_parse_date(issue_raw)
+
+        if _exp_date:
+            date_passed = _exp_date >= _now
+            results["expiration_date"] = {
+                "extracted_value": expiration_raw,
+                "status": "pass" if date_passed else "fail",
+                "details": f"Expiration date {'is current (valid)' if date_passed else 'has expired'}. Checked against today ({_now.strftime('%m/%d/%Y')}).",
+            }
+            if date_passed:
+                matched += 1
+            else:
+                mismatched += 1
+        elif _issue_date:
+            # Determine validity window
+            VALIDITY_WINDOWS_QUICK = [
+                (r"SC-2942|IVU|Planillas.*IVU", 30),
+                (r"SC-6088|Radicacion.*Planillas", 30),
+                (r"SC-6096|HACIENDA.*Deuda|Deuda.*HACIENDA", 30),
+                (r"CRIM", 90), (r"DTRH", 90), (r"CFSE|Fondo.*Seguro", 90),
+                (r"ASUME", 90), (r"SAM", 90),
+            ]
+            _window = 90
+            for pat, days in VALIDITY_WINDOWS_QUICK:
+                if re.search(pat, filename, re.IGNORECASE):
+                    _window = days
+                    break
+            days_elapsed = (_now - _issue_date).days
+            date_passed = days_elapsed <= _window
+            results["issue_date"] = {
+                "extracted_value": issue_raw,
+                "status": "pass" if date_passed else "fail",
+                "details": f"Issued {days_elapsed} days ago. Validity window: {_window} days. {'Current.' if date_passed else 'Expired.'}",
+            }
+            if date_passed:
+                matched += 1
+            else:
+                mismatched += 1
+
+        # Recalculate score with date check included
+        total_compared = matched + mismatched
+        validation_score = round(matched / total_compared, 3) if total_compared > 0 else 0.0
+
+        # Generate reject reasons based on mismatches and validation issues
+        reject_reasons = self._generate_reject_reasons(results, extracted, api_data, filename)
+
+        # ── Member Verification (for Policía documents) ──
+        is_member_verification_doc = self._needs_member_verification(filename, doc_index)
         if is_member_verification_doc:
             member_reasons = self._verify_authorized_members(extracted, api_data, content)
             member_reason_id = len(reject_reasons) + 1
@@ -484,7 +645,7 @@ class FieldValidationExecutor(BaseExecutor):
                 reject_reasons.append(mr)
                 member_reason_id += 1
         # ── Determine if document is optional ──
-        is_optional = doc_index in self.OPTIONAL_DOC_INDICES
+        is_optional = self._is_optional_by_filename(filename) or doc_index in self.OPTIONAL_DOC_INDICES
 
         validation_result = {
             "status": "validated",
@@ -526,10 +687,34 @@ class FieldValidationExecutor(BaseExecutor):
 
         return content
 
-    def _generate_reject_reasons(self, field_results: dict, extracted: dict, api_data: dict) -> list:
+    # Standardized Rejection Reason IDs from Registros API
+    # GET /document-intelligence/reject-reasons?requirementId={id}
+    # These map to the exact RejectionReasonId values expected by the apply-analysis endpoint
+    REJECTION_REASON_IDS = {
+        "company_name_mismatch": 1,         # Company name does not match
+        "ein_ssn_mismatch": 2,              # EIN/SSN does not match
+        "registration_mismatch": 3,         # Registration number mismatch
+        "certificate_mismatch": 4,          # Certificate number mismatch
+        "naics_mismatch": 5,                # NAICS code mismatch
+        "field_mismatch_generic": 6,        # Generic field mismatch
+        "certificate_expired": 57,          # Patente/certificate expired
+        "certificate_not_current": 57,      # Certificate not current (validity window)
+        "date_not_found": 7,                # Date could not be validated
+        "wrong_document": 144,              # El Documento presentado no es el requerido
+        "member_not_found": 8,              # Authorized member not found
+        "outstanding_debt": 9,              # Outstanding debt on certificate
+        "debt_status_unknown": 10,          # Debt status could not be determined
+        "asume_non_compliant": 11,          # ASUME compliance checkbox not marked
+        "asume_status_unknown": 12,         # ASUME compliance status undetermined
+    }
+
+    def _generate_reject_reasons(self, field_results: dict, extracted: dict, api_data: dict, filename: str = "") -> list:
         """
         Generate reject reasons based on field comparison results.
-        Each reason has an id and a descriptive reason string.
+        Each reason includes:
+          - id: sequential within this report
+          - RejectionReasonId: standardized ID from Registros reject-reasons lookup
+          - reason: descriptive text (RejectionReason field for apply-analysis)
         """
         reasons = []
         reason_id = 1
@@ -545,39 +730,61 @@ class FieldValidationExecutor(BaseExecutor):
                 if field_name == "company_name":
                     reasons.append({
                         "id": reason_id,
+                        "RejectionReasonId": self.REJECTION_REASON_IDS["company_name_mismatch"],
                         "reason": f"Nombre de empresa no coincide. Documento muestra '{extracted_val}', API indica '{api_val}'. Similitud: {similarity}"
                     })
                 elif field_name == "ein_ssn":
                     reasons.append({
                         "id": reason_id,
+                        "RejectionReasonId": self.REJECTION_REASON_IDS["ein_ssn_mismatch"],
                         "reason": f"EIN/SSN no coincide con los datos registrados. Valor extraído: '{extracted_val}'"
                     })
                 elif field_name == "registration_number" or field_name == "merchant_registration":
                     reasons.append({
                         "id": reason_id,
+                        "RejectionReasonId": self.REJECTION_REASON_IDS["registration_mismatch"],
                         "reason": f"Número de registro no coincide. Documento muestra '{extracted_val}', API indica '{api_val}'"
                     })
                 elif field_name == "certificate_number":
                     reasons.append({
                         "id": reason_id,
+                        "RejectionReasonId": self.REJECTION_REASON_IDS["certificate_mismatch"],
                         "reason": f"Número de certificación no coincide. Documento muestra '{extracted_val}', API indica '{api_val}'"
                     })
                 elif field_name == "naics_code":
                     api_values = result.get("api_values", [])
                     reasons.append({
                         "id": reason_id,
+                        "RejectionReasonId": self.REJECTION_REASON_IDS["naics_mismatch"],
                         "reason": f"Código NAICS no coincide. Documento muestra '{extracted_val}', códigos registrados: {api_values}"
                     })
                 else:
                     reasons.append({
                         "id": reason_id,
+                        "RejectionReasonId": self.REJECTION_REASON_IDS["field_mismatch_generic"],
                         "reason": f"Campo '{field_name}' no coincide con datos de API. Valor: '{extracted_val}', Esperado: '{api_val}'"
                     })
                 reason_id += 1
 
         # ── Date Validation (3-step logic) ──────────────────────────────
         # Step 1: Try to parse expiration_date and issue_date
-        validity_window_days = 90
+        # Per-document validity windows (days) when no expiration date is present
+        VALIDITY_WINDOWS = [
+            (r"SC-2942|IVU|Planillas.*IVU", 30),
+            (r"SC-6088|Radicacion.*Planillas.*Ingresos", 30),
+            (r"SC-6096|HACIENDA.*Deuda|Deuda.*HACIENDA", 30),
+            (r"CRIM", 90),
+            (r"DTRH", 90),
+            (r"CFSE|Fondo.*Seguro", 90),
+            (r"ASUME", 90),
+            (r"SAM", 90),
+        ]
+        validity_window_days = 90  # default
+        for pattern, days in VALIDITY_WINDOWS:
+            if re.search(pattern, filename, re.IGNORECASE):
+                validity_window_days = days
+                break
+        logger.info(f"Date validity window for '{filename}': {validity_window_days} days")
         now = datetime.now()
 
         # Spanish month name mapping
@@ -633,25 +840,67 @@ class FieldValidationExecutor(BaseExecutor):
             if exp_date < now:
                 reasons.append({
                     "id": reason_id,
+                    "RejectionReasonId": self.REJECTION_REASON_IDS["certificate_expired"],
                     "reason": "Your certificate is not current. Please request it again."
                 })
                 reason_id += 1
         elif issue_date:
-            # Step 2 – No expiration, but issue date found → 90-day window
+            # Step 2 – No expiration, but issue date found → validity window check
             days_elapsed = (now - issue_date).days
             if days_elapsed > validity_window_days:
                 reasons.append({
                     "id": reason_id,
-                    "reason": "Your certificate is not current. Please request it again."
+                    "RejectionReasonId": self.REJECTION_REASON_IDS["certificate_not_current"],
+                    "reason": f"Your certification is not current. Please request it again. It must be less than {validity_window_days} days since issuance. (Issued: {issue_raw}, {days_elapsed} days ago)"
                 })
                 reason_id += 1
         else:
             # Step 1 fail – Neither date found
             reasons.append({
                 "id": reason_id,
+                "RejectionReasonId": self.REJECTION_REASON_IDS["date_not_found"],
                 "reason": "Expiration or Issue date not found or could not be validated."
             })
             reason_id += 1
+
+        # ── Debt Verification (SC-6096, CFSE, CRIM) ──────────────────
+        debt_doc_patterns = [r"SC-6096|Deuda.*HACIENDA|HACIENDA.*Deuda", r"CFSE|Fondo.*Seguro", r"CRIM"]
+        is_debt_doc = any(re.search(p, filename, re.IGNORECASE) for p in debt_doc_patterns)
+        if is_debt_doc:
+            debt_status = extracted.get("debt_status", "")
+            total_amount = extracted.get("total_amount", "")
+            if debt_status == "has_debt":
+                reasons.append({
+                    "id": reason_id,
+                    "RejectionReasonId": self.REJECTION_REASON_IDS["outstanding_debt"],
+                    "reason": f"Outstanding debt found on certificate. Amount: ${total_amount}. A zero-debt balance or approved payment plan is required."
+                })
+                reason_id += 1
+            elif not debt_status:
+                reasons.append({
+                    "id": reason_id,
+                    "RejectionReasonId": self.REJECTION_REASON_IDS["debt_status_unknown"],
+                    "reason": "Debt status could not be determined from the certificate. Please verify the document confirms zero outstanding balance or an approved payment plan."
+                })
+                reason_id += 1
+
+        # ── ASUME Compliance Checkbox Verification ──────────────────
+        if re.search(r"ASUME", filename, re.IGNORECASE):
+            compliance_status = extracted.get("compliance_status", "")
+            if compliance_status == "non_compliant":
+                reasons.append({
+                    "id": reason_id,
+                    "RejectionReasonId": self.REJECTION_REASON_IDS["asume_non_compliant"],
+                    "reason": "ASUME compliance checkbox indicates non-compliance. The certificate must confirm employer compliance."
+                })
+                reason_id += 1
+            elif not compliance_status:
+                reasons.append({
+                    "id": reason_id,
+                    "RejectionReasonId": self.REJECTION_REASON_IDS["asume_status_unknown"],
+                    "reason": "ASUME compliance status could not be verified. Please confirm the compliance checkbox is marked on the certificate."
+                })
+                reason_id += 1
 
         # Check if document title suggests it's not the correct document type
         doc_title = extracted.get("document_title", "")
@@ -667,6 +916,7 @@ class FieldValidationExecutor(BaseExecutor):
             if not found_match:
                 reasons.append({
                     "id": reason_id,
+                    "RejectionReasonId": self.REJECTION_REASON_IDS["wrong_document"],
                     "reason": f"El Documento presentado no es el requerido. Título detectado: '{doc_title}'"
                 })
                 reason_id += 1
@@ -753,12 +1003,34 @@ class FieldValidationExecutor(BaseExecutor):
                 "error": str(e),
             }
 
+    async def _safe_process(self, content):
+        """Wrap process_content_item so crashes always produce a validation report."""
+        try:
+            return await self.process_content_item(content)
+        except Exception as e:
+            import traceback
+            canonical_id = getattr(content.id, 'canonical_id', 'unknown')
+            logger.error(f"FIELD VALIDATION CRASHED for {canonical_id}: {type(e).__name__}: {e}")
+            logger.error(f"Traceback:\n{traceback.format_exc()}")
+            validation_result = {
+                "status": "error",
+                "reason": f"Validation processing error: {type(e).__name__}: {e}",
+                "rejectReasons": [],
+            }
+            content.data["validation_result"] = validation_result
+            try:
+                await self._upload_validation_report(content, validation_result)
+                self._save_local(content, validation_result)
+            except Exception as upload_err:
+                logger.error(f"Failed to upload error report for {canonical_id}: {upload_err}")
+            return content
+
     async def process_input(
         self,
         input: Union['Content', List['Content']],
         ctx: WorkflowContext[Union['Content', List['Content']], Union['Content', List['Content']]]
     ) -> Union['Content', List['Content']]:
         if isinstance(input, list):
-            return [await self.process_content_item(item) for item in input]
+            return [await self._safe_process(item) for item in input]
         else:
-            return await self.process_content_item(input)
+            return await self._safe_process(input)

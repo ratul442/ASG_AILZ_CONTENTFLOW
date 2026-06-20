@@ -15,7 +15,7 @@ from .base import BaseExecutor
 
 logger = logging.getLogger("contentflow.executors.executor_registry")
 
-DEFAULT_CATALOG_PATH = f'{Path(__file__).parent.parent.parent}/executor_catalog.yaml'
+DEFAULT_CATALOG_PATH = f'{Path(__file__).parent.parent}/executor_catalog.yaml'
 
 class ExecutorRegistry:
     """

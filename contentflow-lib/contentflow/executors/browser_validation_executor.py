@@ -146,29 +146,59 @@ class BrowserValidationExecutor(BaseExecutor):
         if self.screenshot_enabled:
             os.makedirs(self.screenshot_output_dir, exist_ok=True)
 
-    # Which portals apply to which document indices (per customer mapping)
-    # SURI: SC-2942 (_09), SC-6088 (_07), SC-6096 (_08)
-    # CRIM: Municipal Revenue (_12)
-    # Validación PR: Criminal Record (_04), Choferil (_11), Unemployment/Disability (_10), ASUME (_14)
-    PORTAL_ELIGIBILITY = {
-        "hacienda":     {7, 8, 9},
-        "crim":         {12},
-        "validacion_pr": {4, 10, 11, 14},
-        "sam_gov":      {3},
+    # Filename patterns → portal mapping (case-insensitive)
+    # Replaces hardcoded index mapping so it works across different tramites
+    FILENAME_PORTAL_PATTERNS = {
+        "hacienda": [
+            r"SC-6088|Radicacion.*Planillas.*Ingresos",
+            r"SC-6096|Certificacion.*De.*Deuda.*HACIENDA|HACIENDA.*Deuda",
+            r"SC-2942|Planillas.*IVU|IVU",
+            r"Registro.*Comerciante|Merchant.*Registration",
+            r"HACIENDA_|HACIENDA-",
+        ],
+        "crim": [
+            r"CRIM",
+        ],
+        "validacion_pr": [
+            r"Antecedentes.*Penales|Policia|Policía|Criminal",
+            r"Desempleo|Incapacidad|DTRH",
+            r"Choferil",
+            r"ASUME",
+        ],
+        "sam_gov": [
+            r"SAM|Entity.*Information.*SAM",
+        ],
     }
 
-    def _get_eligible_portals(self, canonical_id: str) -> list:
-        """Return only portals that are relevant for this document's index."""
-        try:
-            idx = int(canonical_id.rsplit('_', 1)[-1])
-        except (ValueError, IndexError):
-            return self.enabled_portals  # can't determine — try all
-        eligible = [
-            p for p in self.enabled_portals
-            if idx in self.PORTAL_ELIGIBILITY.get(p, set())
-        ]
+    def _classify_doc_type_from_filename(self, content) -> str:
+        """Get the source filename from content."""
+        filename = getattr(content.id, 'filename', '') or ''
+        if not filename:
+            # Try to extract from canonical_id or other data fields
+            filename = getattr(content.id, 'canonical_id', '') or ''
+        return filename
+
+    def _get_eligible_portals(self, canonical_id: str, content=None) -> list:
+        """Return portals relevant for this document based on filename patterns."""
+        # Get filename from content or canonical_id
+        filename = ''
+        if content is not None:
+            filename = self._classify_doc_type_from_filename(content)
+        if not filename:
+            filename = canonical_id
+
+        eligible = []
+        for portal_id in self.enabled_portals:
+            patterns = self.FILENAME_PORTAL_PATTERNS.get(portal_id, [])
+            for pattern in patterns:
+                if re.search(pattern, filename, re.IGNORECASE):
+                    eligible.append(portal_id)
+                    break
+
         if not eligible:
-            logger.info(f"No eligible portals for doc index {idx}")
+            logger.info(f"No eligible portals for document: {filename}")
+        else:
+            logger.info(f"Eligible portals for '{filename}': {eligible}")
         return eligible
 
     @staticmethod
@@ -246,7 +276,7 @@ class BrowserValidationExecutor(BaseExecutor):
 
         # Only check portals relevant to this document
         canonical_id = getattr(content.id, 'canonical_id', 'unknown')
-        eligible_portals = self._get_eligible_portals(canonical_id)
+        eligible_portals = self._get_eligible_portals(canonical_id, content=content)
         if not eligible_portals:
             content.data["browser_validation_result"] = {
                 "status": "skipped",
@@ -869,10 +899,11 @@ class BrowserValidationExecutor(BaseExecutor):
         if idx in DOC_INDEX_TO_AGENCY:
             return DOC_INDEX_TO_AGENCY[idx]
 
-        # Fallback: keyword detection
+        # Fallback: keyword detection from title + filename
         title = (extracted.get("document_title", "") or "").lower()
         filename = str(api_data.get("source_filename", "") or "").lower()
-        combined = f"{title} {filename}"
+        # Also check canonical_id for filename patterns
+        combined = f"{title} {filename} {canonical_id.lower()}"
 
         agency_keywords = {
             "Policía": ["policia", "policía", "penal", "antecedentes", "criminal"],

@@ -97,7 +97,12 @@ class AzureBlobFileCopyExecutor(ParallelExecutor):
         for idx, doc in enumerate(urls):
             try:
                 logger.info(f"Downloading file from {doc['url']}")
-                response = requests.get(doc["url"], stream=True)
+                # Azure Files REST API requires specific headers
+                headers = {
+                    "x-ms-version": "2024-11-04"
+                }
+                response = requests.get(doc["url"], stream=True, headers=headers, verify=False)
+                logger.info(f"Download response status: {response.status_code}, headers: {dict(response.headers)}")
                 response.raise_for_status()
                 file_bytes = response.content
                 # Build blob path and filename

@@ -1,5 +1,18 @@
 """Executor implementations for content processing workflows."""
 
+import logging as _logging
+_logger = _logging.getLogger(__name__)
+
+def _safe_import(module_path, class_name):
+    """Safely import an executor class, returning None if dependencies are missing."""
+    try:
+        import importlib
+        mod = importlib.import_module(module_path, package="contentflow.executors")
+        return getattr(mod, class_name)
+    except (ImportError, NameError, AttributeError) as e:
+        _logger.debug(f"Optional executor {class_name} unavailable: {e}")
+        return None
+
 from .base import BaseExecutor
 
 # Parallel processing executor
@@ -8,7 +21,7 @@ from .parallel_executor import ParallelExecutor
 # Input executor
 from .input_executor import InputExecutor
 
-# Specialized executors
+# Core executors (always available)
 from .azure_blob_input_discovery import AzureBlobInputDiscoveryExecutor
 from .azure_blob_content_retriever import AzureBlobContentRetrieverExecutor
 from .azure_blob_output_executor import AzureBlobOutputExecutor
@@ -16,15 +29,9 @@ from .content_retriever import ContentRetrieverExecutor
 from .ai_search_index_output import AISearchIndexOutputExecutor
 from .azure_document_intelligence_extractor import AzureDocumentIntelligenceExtractorExecutor
 from .azure_content_understanding_extractor import AzureContentUnderstandingExtractorExecutor
-from .pdf_extractor import PDFExtractorExecutor
 from .recursive_text_chunker_executor import RecursiveTextChunkerExecutor
-from .word_extractor import WordExtractorExecutor
-from .powerpoint_extractor import PowerPointExtractorExecutor
-from .excel_extractor import ExcelExtractorExecutor
 from .csv_extractor import CSVExtractorExecutor
 from .table_row_splitter_executor import TableRowSplitterExecutor
-from .azure_openai_agent_executor import AzureOpenAIAgentExecutor
-from .azure_openai_embeddings_executor import AzureOpenAIEmbeddingsExecutor
 from .summarization_executor import SummarizationExecutor
 from .entity_extraction_executor import EntityExtractionExecutor
 from .sentiment_analysis_executor import SentimentAnalysisExecutor
@@ -37,9 +44,7 @@ from .field_mapper_executor import FieldMapperExecutor
 from .field_selector_executor import FieldSelectorExecutor
 from .field_validation_executor import FieldValidationExecutor
 from .web_validation_executor import WebValidationExecutor
-from .browser_validation_executor import BrowserValidationExecutor
 from .gptrag_search_index_doc_generator import GPTRAGSearchIndexDocumentGeneratorExecutor
-from .web_scraping_executor import WebScrapingExecutor
 from .pass_through import PassThroughExecutor
 from .cosmos_db_lookup_executor import CosmosDBLookupExecutor
 
@@ -47,17 +52,21 @@ from .cosmos_db_lookup_executor import CosmosDBLookupExecutor
 from .document_set_initializer import DocumentSetInitializerExecutor
 from .document_set_collector import DocumentSetCollectorExecutor
 from .cross_document_executor import CrossDocumentExecutor
-from .cross_document_comparison import CrossDocumentComparisonExecutor
-from .cross_document_field_aggregator import CrossDocumentFieldAggregatorExecutor
 
 # Control Flow executors
 from .for_each_content import ForEachContentExecutor
 
-# # Knowledge Graph executors
-# from .knowledge_graph_entity_extractor import KnowledgeGraphEntityExtractorExecutor
-# from .knowledge_graph_writer import KnowledgeGraphWriterExecutor
-# from .knowledge_graph_query import KnowledgeGraphQueryExecutor
-# from .knowledge_graph_enrichment import KnowledgeGraphEnrichmentExecutor
+# Optional executors (may fail if dependencies like openai, playwright, etc. are missing)
+AzureOpenAIAgentExecutor = _safe_import(".azure_openai_agent_executor", "AzureOpenAIAgentExecutor")
+AzureOpenAIEmbeddingsExecutor = _safe_import(".azure_openai_embeddings_executor", "AzureOpenAIEmbeddingsExecutor")
+PDFExtractorExecutor = _safe_import(".pdf_extractor", "PDFExtractorExecutor")
+WordExtractorExecutor = _safe_import(".word_extractor", "WordExtractorExecutor")
+PowerPointExtractorExecutor = _safe_import(".powerpoint_extractor", "PowerPointExtractorExecutor")
+ExcelExtractorExecutor = _safe_import(".excel_extractor", "ExcelExtractorExecutor")
+BrowserValidationExecutor = _safe_import(".browser_validation_executor", "BrowserValidationExecutor")
+WebScrapingExecutor = _safe_import(".web_scraping_executor", "WebScrapingExecutor")
+CrossDocumentComparisonExecutor = _safe_import(".cross_document_comparison", "CrossDocumentComparisonExecutor")
+CrossDocumentFieldAggregatorExecutor = _safe_import(".cross_document_field_aggregator", "CrossDocumentFieldAggregatorExecutor")
 
 from .executor_registry import ExecutorRegistry
 from .executor_config import ExecutorConfig, ExecutorInstanceConfig

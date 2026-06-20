@@ -8,10 +8,15 @@ from typing import Dict, Any, Optional
 try:
     from agent_framework.openai import OpenAIChatClient
     from agent_framework import Agent, AgentResponse
+    HAS_AGENT_OPENAI = True
 except ImportError:
-    raise ImportError(
-        "agent-framework import error. Either the library is not installed or there is \
-            an issue with the version of the installed library. "
+    HAS_AGENT_OPENAI = False
+    # Define stubs so the class can be parsed without the optional dependency
+    OpenAIChatClient = None
+    Agent = object
+    AgentResponse = None
+    logging.getLogger(__name__).warning(
+        "agent-framework-openai not installed. AzureOpenAIAgentExecutor will be unavailable."
     )
     
 from ..utils.credential_provider import get_azure_credential

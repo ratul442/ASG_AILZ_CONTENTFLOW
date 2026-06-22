@@ -44,6 +44,7 @@ from .field_mapper_executor import FieldMapperExecutor
 from .field_selector_executor import FieldSelectorExecutor
 from .field_validation_executor import FieldValidationExecutor
 from .web_validation_executor import WebValidationExecutor
+from .api_callback_executor import APICallbackExecutor
 from .gptrag_search_index_doc_generator import GPTRAGSearchIndexDocumentGeneratorExecutor
 from .pass_through import PassThroughExecutor
 from .cosmos_db_lookup_executor import CosmosDBLookupExecutor

@@ -830,6 +830,17 @@ class FieldValidationExecutor(BaseExecutor):
                         continue
             return None
 
+        # ── Determine if this document type requires date validation ──
+        _requires_date = False
+        for _pat, _fields in self.VALIDATION_FIELDS_BY_FILENAME:
+            if _fields and re.search(_pat, filename, re.IGNORECASE):
+                if "expiration_date" in _fields or "issue_date" in _fields:
+                    _requires_date = True
+                break
+        # If no pattern matched at all, default to requiring dates
+        if not any(re.search(p, filename, re.IGNORECASE) for p, _ in self.VALIDATION_FIELDS_BY_FILENAME):
+            _requires_date = True
+
         expiration_raw = extracted.get("expiration_date", "")
         issue_raw = extracted.get("issue_date", "") or extracted.get("date", "")
         exp_date = _parse_date(expiration_raw)
@@ -854,14 +865,16 @@ class FieldValidationExecutor(BaseExecutor):
                     "reason": f"Your certification is not current. Please request it again. It must be less than {validity_window_days} days since issuance. (Issued: {issue_raw}, {days_elapsed} days ago)"
                 })
                 reason_id += 1
-        else:
-            # Step 1 fail – Neither date found
+        elif _requires_date:
+            # Step 1 fail – Neither date found, but only reject if this doc type requires dates
             reasons.append({
                 "id": reason_id,
                 "RejectionReasonId": self.REJECTION_REASON_IDS["date_not_found"],
                 "reason": "Expiration or Issue date not found or could not be validated."
             })
             reason_id += 1
+        else:
+            logger.info(f"No date required for document '{filename}'; skipping date rejection.")
 
         # ── Debt Verification (SC-6096, CFSE, CRIM) ──────────────────
         debt_doc_patterns = [r"SC-6096|Deuda.*HACIENDA|HACIENDA.*Deuda", r"CFSE|Fondo.*Seguro", r"CRIM"]

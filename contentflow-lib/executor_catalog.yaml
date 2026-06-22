@@ -161,6 +161,90 @@ executor_catalog:
         default: "validation-results"
         ui_component: "input"
 
+  - id: api_callback_executor
+    name: "API Callback Executor"
+    description: "Posts aggregated validation results back to the Registros API (Step 5 — apply-analysis). Aggregates all document validation results, determines pass/fail status, and sends the structured payload."
+    module_path: contentflow.executors.api_callback_executor
+    class_name: APICallbackExecutor
+    tags: [output, api, callback, registros, integration]
+    category: "output"
+    version: "1.0"
+    settings_schema:
+      api_base_url:
+        type: string
+        title: "API Base URL"
+        description: "Registros API base URL (e.g., https://rulrup-staging-api.azurewebsites.net/api/)"
+        required: true
+        ui_component: "input"
+      username:
+        type: string
+        title: "Username"
+        description: "API username for authentication"
+        required: true
+        ui_component: "input"
+      password:
+        type: string
+        title: "Password"
+        description: "API password for authentication"
+        required: true
+        ui_component: "input"
+      api_key:
+        type: string
+        title: "API Key"
+        description: "API key (JWT) for authentication"
+        required: true
+        ui_component: "input"
+      success_status_id:
+        type: number
+        title: "Success Status ID"
+        description: "StatusId to send when all requirements pass validation"
+        required: false
+        default: 2
+        ui_component: "number"
+      failure_status_id:
+        type: number
+        title: "Failure Status ID"
+        description: "StatusId to send when one or more requirements fail validation"
+        required: false
+        default: 1002
+        ui_component: "number"
+      dry_run:
+        type: boolean
+        title: "Dry Run"
+        description: "If enabled, logs the payload but does not POST to the API. Use for testing."
+        required: false
+        default: true
+        ui_component: "checkbox"
+      storage_account_name:
+        type: string
+        title: "Storage Account Name"
+        description: "Azure Blob Storage account name for uploading callback payload"
+        required: false
+        default: null
+        ui_component: "input"
+      credential_type:
+        type: string
+        title: "Credential Type"
+        description: "Credential type for accessing Azure Blob Storage"
+        required: false
+        default: "default_azure_credential"
+        options: ["default_azure_credential", "azure_key_credential"]
+        ui_component: "select"
+      credential_key:
+        type: string
+        title: "Credential Key"
+        description: "Azure Blob Storage account key (if using azure_key_credential)"
+        required: false
+        default: null
+        ui_component: "input"
+      container_name:
+        type: string
+        title: "Container Name"
+        description: "Blob container name for callback payload output"
+        required: false
+        default: "callback-results"
+        ui_component: "input"
+
   - id: web_validation_executor
     name: "Web Validation Executor"
     description: "Validates extracted document fields against external web portals (e.g., CRIM portal) to verify certificate authenticity."

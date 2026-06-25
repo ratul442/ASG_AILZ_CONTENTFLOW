@@ -52,9 +52,9 @@ class FieldExtractorExecutor(BaseExecutor):
             ("registration_number", re.compile(r"(?:n[uú]mero\s*de\s*registro|registration\s*(?:no|number|#)|registro\s*(?:no|#))\s*[:\-]?\s*([\w\-]{3,})", re.IGNORECASE), 1),
             # certificate_number: require the captured value to start with a digit or contain digits
             ("certificate_number", re.compile(r"(?:certificaci[oó]n\s*(?:no|n[uú]m(?:ero)?|number|#)|certificate\s*(?:no|number|#))\s*[:\-]?\s*(\d[\w\-]*)", re.IGNORECASE), 1),
-            ("date", re.compile(r"(?:fecha|date)\s*[:\-]?\s*(\d{1,2}[\s/\-]\w{3,}[\s/\-]\d{2,4}|\d{1,2}/\d{1,2}/\d{2,4}|\w{3,}\s+\d{1,2},?\s+\d{4})", re.IGNORECASE), 1),
+            ("date", re.compile(r"(?:fecha|date)\s*[:\-]?\s*\n?\s*(\d{1,2}[\s/\-]\w{3,}[\s/\-]\d{2,4}|\d{1,2}/\d{1,2}/\d{2,4}|\w{3,}\s+\d{1,2},?\s+\d{4}|\d{1,2}\s+\w{3,}\s+\d{4})", re.IGNORECASE), 1),
             ("issue_date", re.compile(r"(?:fecha\s*de\s*(?:emisi[oó]n|expedici[oó]n|certificaci[oó]n)|fecha\s*emitida|issue\s*date|issued\s*date|certificate\s*date|emitido|expedido|generado)\s*[:\-]?\s*(\d{1,2}[\s/\-]\w{3,}[\s/\-]\d{2,4}|\d{1,2}/\d{1,2}/\d{2,4}|\d{4}-\d{2}-\d{2}|\w{3,}\s+\d{1,2},?\s+\d{4})", re.IGNORECASE), 1),
-            ("ein_ssn", re.compile(r"(?:EIN|SSN|FEIN|employer\s*identification|patronal|n[uú]mero\s*patronal\s*federal)\s*[:\-#]?\s*(\d[\d\-]{3,})", re.IGNORECASE), 1),
+            ("ein_ssn", re.compile(r"(?:EIN|SSN|FEIN|employer\s*identification|patronal\s*federal|cuenta\s*patronal\s*federal|n[uú]mero\s*(?:de\s*cuenta\s*)?patronal\s*federal)\s*(?:\(EIN\))?\s*[:\-#]?\s*(\d[\d\-]{3,})", re.IGNORECASE), 1),
             ("ssn_last_four", re.compile(r"[xX*]{2,}[-\s]?[xX*]{2,}[-\s]?(\d{4})", re.IGNORECASE), 1),
             ("naics_code", re.compile(r"(?:NAICS|c[oó]digo\s*NAICS)\s*[:\-]?\s*(\d{4,6})", re.IGNORECASE), 1),
             ("merchant_registration", re.compile(r"(?:registro\s*de\s*comerciante|merchant\s*registration|n[uú]mero\s*de\s*comerciante)\s*[:\-]?\s*([\w\-]{3,})", re.IGNORECASE), 1),
@@ -102,18 +102,26 @@ class FieldExtractorExecutor(BaseExecutor):
                         continue
                 fields[field_name] = value
 
-        # 1b. Additional patterns for unstructured documents (Good Standing, Registration)
+        if "company_name" not in fields:
+            # Markdown heading with corporate suffix (SAM.gov, etc.)
+            # Matches: "## INFORMATION TECHNOLOGY DEVELOPERS GROUP, INC"
+            m = re.search(r'^#{2,}\s+([A-Z][A-Za-z\s&,\.]+(?:INC|LLC|CORP|LTD|GROUP|COMPANY|CO)[\.,]?)\s*$', text, re.MULTILINE)
+            if m:
+                val = re.sub(r'\s+', ' ', m.group(1)).strip().rstrip(',.')
+                if len(val) >= 10:
+                    fields["company_name"] = val
+                    logger.info(f"Company name from markdown heading: '{val}'")
         if "company_name" not in fields:
             # CERTIFICO: Que "COMPANY NAME" (Good Standing / Incorporación)
-            # Flexible: handles mixed case, quotes, line wraps, bold markers
-            m = re.search(r'CERTIFICO[:\s,]+Que\s+["\u201c\*]*(.+?)[\*"\u201d]*[,\s]+registro\s+n[uú]mero', text, re.IGNORECASE | re.DOTALL)
+            # Flexible: handles "Que," and "Que " — comma or space after Que
+            m = re.search(r'CERTIFICO[:\s,]+Que[,\s]+["\u201c\*]*(.+?)[\*"\u201d]*[,\s]+registro\s+n[uú]mero', text, re.IGNORECASE | re.DOTALL)
             if m:
                 val = re.sub(r'\s+', ' ', m.group(1)).strip().rstrip(',.')
                 if len(val) >= 5:
                     fields["company_name"] = val
             else:
                 # Fallback: CERTIFICO + uppercase company name ending with INC/LLC/CORP etc
-                m = re.search(r'CERTIFICO[:\s,]+Que\s+["\u201c\*]*([A-Z][\w\s,\.]+(?:INC|LLC|CORP|LTD|GROUP|COMPANY|CO)[\.,]?)', text, re.DOTALL)
+                m = re.search(r'CERTIFICO[:\s,]+Que[,\s]+["\u201c\*]*([A-Z][\w\s,\.]+(?:INC|LLC|CORP|LTD|GROUP|COMPANY|CO)[\.,]?)', text, re.DOTALL)
                 if m:
                     val = re.sub(r'\s+', ' ', m.group(1)).strip().rstrip(',.')
                     if len(val) >= 5:
@@ -123,6 +131,23 @@ class FieldExtractorExecutor(BaseExecutor):
             m = re.search(r'Nombre\s+legal[:\s]+\n?\s*([A-Z][A-Z\s]+(?:INC|LLC|CORP|GROUP|LTD)[\.,]?)', text, re.IGNORECASE)
             if m:
                 fields["company_name"] = m.group(1).strip().rstrip(',.')
+        if "company_name" not in fields:
+            # Hacienda certs: standalone company name (all caps + INC/LLC/CORP) followed by address
+            # Matches: "INFORMATION TECHNOLOGY DEVELOPERS GROUP INC\n35 CALLE..." or similar
+            m = re.search(r'(?:^|\n)\s*([A-Z][A-Z\s&,\.]+(?:INC|LLC|CORP|LTD|GROUP|COMPANY|CO)[\.,]?)\s*\n\s*(?:\d{1,5}\s+\w|PMB|P\.?O\.?\s*BOX|CALLE|AVE|CARR)', text)
+            if m:
+                val = re.sub(r'\s+', ' ', m.group(1)).strip().rstrip(',.')
+                if len(val) >= 5:
+                    fields["company_name"] = val
+                    logger.info(f"Hacienda standalone company name: '{val}'")
+        if "company_name" not in fields:
+            # English Certificate of Existence: "CERTIFY: That...COMPANY NAME, INC., with registration number"
+            m = re.search(r'CERTIF[YO][:\s]+That[^A-Z]*([A-Z][A-Za-z\s&,\.]+(?:INC|LLC|CORP|LTD|GROUP|COMPANY|CO)[\.,]?)', text, re.DOTALL)
+            if m:
+                val = re.sub(r'\s+', ' ', m.group(1)).strip().rstrip(',.')
+                if len(val) >= 10:
+                    fields["company_name"] = val
+                    logger.info(f"Company name from English CERTIFY: '{val}'")
         if "issue_date" not in fields and "date" not in fields:
             # "hoy, 15 de mayo de 2026" or "hoy 15 de mayo de 2026"
             m = re.search(r'hoy[,\s]+?(\d{1,2}\s+de\s+\w+\s+de\s+\d{4})', text, re.IGNORECASE)
@@ -144,13 +169,25 @@ class FieldExtractorExecutor(BaseExecutor):
             if m:
                 fields["agent_type"] = m.group(1).strip()
         if "expiration_date" not in fields:
-            # "Fecha de expiración:\n31-mar.-2027" or similar
-            m = re.search(r'(?:fecha\s*de\s*expiraci[oó]n|expiration\s*date)[:\s]*\n?\s*(\d{1,2}[-/]\w{3,}[-/.]\d{2,4})', text, re.IGNORECASE)
+            # "Fecha de expiración:\n31-mar.-2027" or "Fecha Expiración / Expires Date\n(DD/MM/YYYY)\n31-mar.-2027"
+            m = re.search(r'(?:fecha\s*(?:de\s*)?expiraci[oó]n|expiration\s*date|expires?\s*date)[:\s]*(?:.*?\n)*?\s*(\d{1,2}[-/]\w{3,}\s*\.?\s*[-/.]\s*\d{2,4})', text, re.IGNORECASE)
             if m:
                 fields["expiration_date"] = m.group(1).strip()
+            else:
+                # Broader: find DD-mon.-YYYY pattern (abbreviated month with dot) anywhere in text
+                # Look for the LAST occurrence (more likely to be expiration, not issue date)
+                all_dates = re.findall(r'(\d{1,2}-(?:ene|feb|mar|abr|may|jun|jul|ago|sep|oct|nov|dic)\s*\.?\s*-\s*\d{4})', text, re.IGNORECASE)
+                if all_dates:
+                    # If issue_date already has one of these, use the OTHER one as expiration
+                    issue_val = fields.get("issue_date", "")
+                    for d in reversed(all_dates):
+                        if d != issue_val:
+                            fields["expiration_date"] = d.strip()
+                            logger.info(f"Expiration date from DD-mon.-YYYY fallback: '{d}'")
+                            break
         if "issue_date" not in fields and "date" not in fields:
             # "Fecha de emisión:\n12-jun.-2025"
-            m = re.search(r'(?:fecha\s*de\s*emisi[oó]n|issue\s*date)[:\s]*\n?\s*(\d{1,2}[-/]\w{3,}[-/.]\d{2,4})', text, re.IGNORECASE)
+            m = re.search(r'(?:fecha\s*de\s*emisi[oó]n|issue\s*date)[:\s]*\n?\s*(\d{1,2}[-/]\w{3,}\s*\.?\s*[-/.]\s*\d{2,4})', text, re.IGNORECASE)
             if m:
                 fields["issue_date"] = m.group(1).strip()
         if "company_name" not in fields:
@@ -172,15 +209,46 @@ class FieldExtractorExecutor(BaseExecutor):
             m = re.search(r'(\d{1,2}\s+DE\s+\w+\s+(?:DE\s+)?\d{4})', text)
             if m:
                 fields["date"] = m.group(1).strip()
+        # Hacienda-specific: "Fecha:" followed eventually by "DD month YYYY" (may have other text in between)
+        # This handles cases where DI doesn't output "Fecha: 15 mayo 2026" on the same line
+        if "issue_date" not in fields or not re.search(r'\d', fields.get("issue_date", "")):
+            hacienda_date_m = re.search(r'Fecha\s*:\s*(?:.*?\n)?\s*(\d{1,2}\s+\w{3,}\s+\d{4})', text, re.IGNORECASE)
+            if hacienda_date_m:
+                fields["issue_date"] = hacienda_date_m.group(1).strip()
+                logger.info(f"Hacienda date override: issue_date = '{fields['issue_date']}'")
+            elif "date" not in fields:
+                # Last resort: find any standalone "DD monthname YYYY" pattern in the text
+                standalone_date_m = re.search(r'(?<!\w)(\d{1,2}\s+(?:enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|octubre|noviembre|diciembre)\s+\d{4})(?!\w)', text, re.IGNORECASE)
+                if standalone_date_m:
+                    fields["date"] = standalone_date_m.group(1).strip()
+                    logger.info(f"Standalone Spanish date found: '{fields['date']}'")
+        # Prefer footer/signature date for DTRH docs — "EN SAN JUAN, PUERTO RICO, 15 DE MAYO 2026"
+        # This overrides any earlier date that may be a quarter-end date, not the issuance date
+        footer_date_m = re.search(r'(?:EN\s+SAN\s+JUAN|PUERTO\s+RICO)[,\s]+(\d{1,2}\s+DE\s+\w+\s+(?:DE\s+)?\d{4})', text, re.IGNORECASE)
+        if footer_date_m:
+            footer_date_val = footer_date_m.group(1).strip()
+            if fields.get("date") != footer_date_val:
+                logger.info(f"Overriding date with footer date: '{footer_date_val}' (was: '{fields.get('date', fields.get('issue_date', 'empty'))}')")
+                fields["date"] = footer_date_val
+                if "issue_date" in fields:
+                    fields["issue_date"] = footer_date_val
         # Clean up issue_date if it contains garbage (header text instead of actual date)
         if "issue_date" in fields and not re.search(r'\d', fields["issue_date"]):
             del fields["issue_date"]
+        # Clean up issue_date if it contains mixed-language garbage (e.g., "31 DE March DE 2026")
+        if "issue_date" in fields:
+            val = fields["issue_date"]
+            # If it has English month names mixed with Spanish "DE", it's DI translation artifact
+            if re.search(r'\bDE\b', val) and re.search(r'\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\b', val, re.IGNORECASE):
+                logger.info(f"Removing mixed-language issue_date: '{val}'")
+                del fields["issue_date"]
         ALLOWED_FIELDS = {
             "document_title", "company_name", "ein_ssn", "issue_date", "expiration_date",
             "certificate_number", "registration_number", "merchant_registration",
             "naics_code", "agent_type", "ssn_last_four", "page_count",
             "unique_entity_id", "application_number", "total_amount",
-            "debt_status", "compliance_status", "date",
+            "debt_status", "debt_statement", "compliance_status", "date",
+            "tax_filing_years",
             # Alternate names that get normalized later
             "id_de_contribuyente", "id_de_correspondencia",
         }
@@ -191,9 +259,15 @@ class FieldExtractorExecutor(BaseExecutor):
             col_count = table.get("column_count", 0)
             if col_count == 2:
                 row_data = {}
+                header_rows = set()
                 for cell in cells:
                     row_data.setdefault(cell["row_index"], {})[cell["column_index"]] = cell.get("content", "")
+                    # Track header rows to skip them
+                    if cell.get("kind") == "columnHeader":
+                        header_rows.add(cell["row_index"])
                 for row_idx, cols in row_data.items():
+                    if row_idx in header_rows:
+                        continue  # Skip header rows — they contain labels, not values
                     key = cols.get(0, "").strip()
                     value = cols.get(1, "").strip()
                     if key and value:
@@ -222,7 +296,10 @@ class FieldExtractorExecutor(BaseExecutor):
             "nombre_empresa": "company_name",
             "nombre_entidad": "company_name",
             "nombre_corporacion": "company_name",
+            "corporation_name": "company_name",
             "patrono": "company_name",
+            "fecha": "issue_date",
+            "date": "issue_date",
             "fecha_emitida": "issue_date",
             "issued_date": "issue_date",
             "fecha_emitida__issued_date": "issue_date",
@@ -230,10 +307,13 @@ class FieldExtractorExecutor(BaseExecutor):
             "fecha_de_emisin_issue_date": "issue_date",
             "fecha_de_emision_issue_date": "issue_date",
             "fecha_expiracion": "expiration_date",
+            "fecha_expiracin": "expiration_date",
             "expires_date": "expiration_date",
             "expiration_date": "expiration_date",
             "fecha_expiracion__expires_date": "expiration_date",
+            "fecha_expiracin__expires_date": "expiration_date",
             "fecha_expiracion_expires_date": "expiration_date",
+            "fecha_expiracin_expires_date": "expiration_date",
             "fecha_de_expiracion_expires_date": "expiration_date",
             "fecha_de_expiracin_expires_date": "expiration_date",
             "fecha_de_emision": "issue_date",
@@ -302,14 +382,20 @@ class FieldExtractorExecutor(BaseExecutor):
             # Strategy 1: Header row (row 0) maps to data row (row 1) in same column
             header_cells = {c["column_index"]: c.get("content", "") for c in cells if c.get("row_index") == 0}
             for col_idx, header in header_cells.items():
-                if ISSUE_DATE_HEADERS.search(header) and "issue_date" not in fields:
+                if ISSUE_DATE_HEADERS.search(header):
                     val_cells = [c for c in cells if c.get("row_index") == 1 and c.get("column_index") == col_idx]
                     if val_cells:
-                        fields["issue_date"] = val_cells[0].get("content", "").strip()
-                elif EXPIRY_DATE_HEADERS.search(header) and "expiration_date" not in fields:
+                        table_val = val_cells[0].get("content", "").strip()
+                        if re.search(r'\d', table_val):
+                            fields["issue_date"] = table_val
+                            logger.info(f"Table Strategy 1: issue_date = '{table_val}' (header: '{header}')")
+                elif EXPIRY_DATE_HEADERS.search(header):
                     val_cells = [c for c in cells if c.get("row_index") == 1 and c.get("column_index") == col_idx]
                     if val_cells:
-                        fields["expiration_date"] = val_cells[0].get("content", "").strip()
+                        table_val = val_cells[0].get("content", "").strip()
+                        if re.search(r'\d', table_val):
+                            fields["expiration_date"] = table_val
+                            logger.info(f"Table Strategy 1: expiration_date = '{table_val}' (header: '{header}')")
             # Strategy 2: Label in one cell, value in the NEXT column (same row)
             cell_map = {}
             for c in cells:
@@ -326,10 +412,63 @@ class FieldExtractorExecutor(BaseExecutor):
                     if len(next_val) >= 5:
                         fields["company_name"] = next_val
 
-        # Clean up garbage issue_date/expiration_date (header text instead of actual date values)
-        for date_key in ("issue_date", "expiration_date"):
-            if date_key in fields and not re.search(r'\d', fields[date_key]):
-                del fields[date_key]
+        # 2b-extra: Scan ALL table cells for DD-mon.-YYYY or DD/MM/YYYY dates if still missing
+        if "expiration_date" not in fields:
+            for table in tables:
+                cells = table.get("cells", [])
+                for c in cells:
+                    cell_text = c.get("content", "").strip()
+                    # Try DD-mon.-YYYY format (e.g., 31-mar.-2027)
+                    m = re.search(r'(\d{1,2}-(?:ene|feb|mar|abr|may|jun|jul|ago|sep|oct|nov|dic)\s*\.?\s*-\s*\d{4})', cell_text, re.IGNORECASE)
+                    if not m:
+                        # Try DD/MM/YYYY format (e.g., 30/06/2026)
+                        m = re.search(r'(\d{1,2}/\d{1,2}/\d{4})', cell_text)
+                    if m:
+                        date_val = m.group(1)
+                        # Don't use if it's already the issue_date
+                        if date_val != fields.get("issue_date", ""):
+                            # Check if the cell or its label contains "expiraci" or "expires"
+                            row_idx = c.get("row_index")
+                            col_idx = c.get("column_index")
+                            # Check adjacent cells and headers for expiration context
+                            nearby_text = cell_text.lower()
+                            for c2 in cells:
+                                if c2.get("row_index") == row_idx or (c2.get("row_index") == 0 and c2.get("column_index") == col_idx):
+                                    nearby_text += " " + c2.get("content", "").lower()
+                            if re.search(r'expiraci[oó]n|expires|vencimiento|expiration', nearby_text):
+                                fields["expiration_date"] = date_val
+                                logger.info(f"Expiration date from table cell scan: '{date_val}'")
+                                break
+                if "expiration_date" in fields:
+                    break
+
+        # 2c. Extract tax filing years table (SC-6088 — "Año Contributivo / Estatus")
+        tax_filing_years = {}
+        for table in tables:
+            cells = table.get("cells", [])
+            cell_map = {}
+            for c in cells:
+                cell_map[(c.get("row_index"), c.get("column_index"))] = c.get("content", "").strip()
+            for (row, col), content_val in cell_map.items():
+                # Check if this cell contains a 4-digit year (2019-2030)
+                year_match = re.match(r'^(20[12]\d)$', content_val.strip())
+                if year_match:
+                    year = int(year_match.group(1))
+                    # Get the status from the next column
+                    status = cell_map.get((row, col + 1), "").strip()
+                    if not status:
+                        status = cell_map.get((row, col + 2), "").strip()
+                    if status:
+                        tax_filing_years[year] = status
+        # Also try regex on raw text: "2025 Planilla radicada" pattern
+        if not tax_filing_years and text:
+            for m in re.finditer(r'(20[12]\d)\s+(Planilla\s+radicada|No\s+radicada|Pendiente|Extensi[oó]n)', text, re.IGNORECASE):
+                year = int(m.group(1))
+                status = m.group(2).strip()
+                tax_filing_years[year] = status
+        if tax_filing_years:
+            fields["tax_filing_years"] = tax_filing_years
+            logger.info(f"Tax filing years extracted: {tax_filing_years}")
 
         # 3a. Map known Spanish/alternate table keys to standard field names
         TABLE_KEY_MAPPING = {
@@ -358,10 +497,13 @@ class FieldExtractorExecutor(BaseExecutor):
             "fecha_de_certificacin_certificate_date": "issue_date",
             "certificate_date": "issue_date",
             "fecha_expiracion": "expiration_date",
+            "fecha_expiracin": "expiration_date",
             "expires_date": "expiration_date",
             "expiration_date": "expiration_date",
             "fecha_expiracion__expires_date": "expiration_date",
+            "fecha_expiracin__expires_date": "expiration_date",
             "fecha_expiracion_expires_date": "expiration_date",
+            "fecha_expiracin_expires_date": "expiration_date",
             "fecha_de_expiracion_expires_date": "expiration_date",
             "fecha_de_expiracin_expires_date": "expiration_date",
             "fecha_de_emision": "issue_date",
@@ -431,7 +573,7 @@ class FieldExtractorExecutor(BaseExecutor):
             if ai_fields:
                 # AI values override regex — AI is more reliable for key fields
                 # For ein_ssn and company_name, always prefer AI since regex often grabs wrong values
-                AI_ALWAYS_WINS = {"ein_ssn", "company_name", "naics_code", "registration_number"}
+                AI_ALWAYS_WINS = {"ein_ssn", "company_name", "naics_code", "registration_number", "issue_date"}
                 for key, ai_value in ai_fields.items():
                     if not ai_value or ai_value == "null":
                         continue
@@ -446,10 +588,17 @@ class FieldExtractorExecutor(BaseExecutor):
                         logger.debug(f"AI override: {key} = '{ai_value}' (was: '{current}')")
 
         # 5. Extract debt/compliance status from document body text
-        # Debt check for SC-6096, CFSE, CRIM
+        # Debt check for SC-6096, CFSE, CRIM, DTRH
         text_lower = text.lower() if text else ""
-        if re.search(r'no\s+(?:tiene|adeuda|debe)', text_lower) or re.search(r'does\s+not\s+(?:have|owe).*debt', text_lower) or 'no debt' in text_lower:
+        no_debt_match = re.search(r'(no\s+tiene\s+(?:una\s+)?deuda[^\n]*|no\s+tiene\s+deudas[^\n]*|no\s+(?:adeuda|debe)[^\n]*|does\s+not\s+(?:have|owe)[^\n]*debt[^\n]*|you\s+do\s+not\s+have\s+a\s+debt[^\n]*)', text, re.IGNORECASE)
+        if no_debt_match or 'no debt' in text_lower:
             fields["debt_status"] = "no_debt"
+            if no_debt_match:
+                statement = no_debt_match.group(1).strip()
+                # Limit to max 200 chars to avoid capturing entire document
+                if len(statement) > 200:
+                    statement = statement[:200].rsplit(' ', 1)[0] + '...'
+                fields["debt_statement"] = statement
         elif re.search(r'(?:adeuda|debe|owes|balance\s*(?:due|owed)|deuda\s*(?:pendiente|total))', text_lower):
             # Check if the actual amount is zero
             debt_match = re.search(r'\$\s*([\d,]+\.\d{2})', text)
@@ -467,10 +616,21 @@ class FieldExtractorExecutor(BaseExecutor):
             fields["debt_status"] = "payment_plan"
 
         # Compliance checkbox for ASUME
-        if re.search(r'cumplimiento|compliance|cumple|compliant', text_lower):
-            if re.search(r'(?:✓|✔|☑|\[x\]|\[X\]|cumple|en\s*cumplimiento|certifica.*cumplimiento|compliant)', text):
+        # ASUME has TWO options — BOTH mean compliant:
+        #   ☐/☑ "Está cumpliendo con la(s) orden(es)..." (actively complying with orders)
+        #   ☐/☑ "NO existe ninguna orden..." (no active orders = compliant by default)
+        # Only NON-COMPLIANT if explicit "no cumple" or "incumplimiento" text exists
+        if re.search(r'ASUME|cumplimiento.*patronal|employer.*compliance', text_lower):
+            # Check for X/checkbox next to "NO existe ninguna orden" (= compliant)
+            has_no_active_orders = bool(re.search(r'(?:X|x|✓|✔|☑|\[x\]|\[X\])\s*(?:Al\s+presente,?\s*)?NO\s+existe\s+ninguna\s+orden', text, re.IGNORECASE))
+            # Check for X/checkbox next to "Está cumpliendo" (= compliant)
+            is_complying = bool(re.search(r'(?:X|x|✓|✔|☑|\[x\]|\[X\])\s*(?:Está|Esta)\s+cumpliendo', text, re.IGNORECASE))
+            # General compliance markers
+            has_compliance_marker = bool(re.search(r'en\s*cumplimiento|certifica.*cumplimiento|is\s*compliant', text, re.IGNORECASE))
+
+            if has_no_active_orders or is_complying or has_compliance_marker:
                 fields["compliance_status"] = "compliant"
-            elif re.search(r'(?:✗|☐|no\s*cumple|incumplimiento|non.?compliant)', text):
+            elif re.search(r'no\s+cumple|incumplimiento|non.?compliant', text, re.IGNORECASE):
                 fields["compliance_status"] = "non_compliant"
         # 6. Promote 'date' to 'issue_date' if issue_date was not found
         if "issue_date" not in fields and "date" in fields:
@@ -497,8 +657,8 @@ class FieldExtractorExecutor(BaseExecutor):
             system_prompt = """You are a document field extractor for Puerto Rico government certificates and business documents.
 Extract the following fields from the document text. Return ONLY a JSON object with these keys:
 - company_name: The name of the company/entity the certificate is about (NOT the issuing agency)
-- issue_date: The date the document was issued/generated (format: MM/DD/YYYY or as found)
-- expiration_date: The date the document expires (format: MM/DD/YYYY or as found)
+- issue_date: The date the document was issued/generated 
+- expiration_date: The date the document expires 
 - ein_ssn: The Federal EIN/FEIN number (format: XX-XXXXXXX, digits and dashes only)
 - merchant_registration: The merchant registration number
 - certificate_number: The certificate number

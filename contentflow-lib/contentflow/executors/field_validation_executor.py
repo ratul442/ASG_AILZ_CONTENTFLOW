@@ -40,20 +40,20 @@ class FieldValidationExecutor(BaseExecutor):
         (r"Company.Profile|Declaracion.Jurada",           None),  # excluded
         (r"Resolucion.Corporativa",                        {"company_name"}),
         (r"SAM|Entity.*Information.*SAM",                   {"company_name", "unique_entity_id", "expiration_date"}),
-        (r"Antecedentes.*Penales|Policia|Policía",         {"ssn_last_four"}),  # personal cert — no company_name
-        (r"SC-6088|Radicacion.*Planillas.*Ingresos",       {"company_name", "ein_ssn", "issue_date"}),
+        (r"Antecedentes.*Penales|Policia|Policía",         set()),  # completeness check only — no per-field validation
+        (r"SC-6088|Radicacion.*Planillas.*Ingresos",       {"company_name", "ein_ssn"}),
         (r"SC-6096|HACIENDA.*Deuda|Deuda.*HACIENDA",       {"company_name", "ein_ssn", "issue_date"}),
         (r"SC-2942|SC-2918|IVU|Planillas.*IVU",            {"company_name", "ein_ssn", "merchant_registration", "expiration_date", "naics_code", "agent_type"}),
         (r"Registro.*Comerciante|Merchant",                {"company_name", "ein_ssn", "merchant_registration", "expiration_date", "naics_code", "agent_type"}),
         (r"HACIENDA",                                      {"company_name", "ein_ssn", "issue_date"}),
         (r"Desempleo|Incapacidad|DTRH.*Seguro",            {"company_name", "ein_ssn", "issue_date"}),
-        (r"Choferil",                                      {"company_name", "ein_ssn", "issue_date"}),
+        (r"Choferil",                                      {"ein_ssn", "issue_date"}),
         (r"DTRH",                                          {"company_name", "ein_ssn", "issue_date"}),
         (r"CFSE|Fondo.*Seguro.*Estado",                    {"company_name", "ein_ssn", "ssn_last_four", "expiration_date"}),
         (r"ASUME",                                         {"company_name", "ein_ssn", "issue_date"}),
-        (r"CRIM",                                          {"company_name", "ein_ssn", "expiration_date"}),
+        (r"CRIM",                                          {"company_name", "ein_ssn", "ssn_last_four", "expiration_date"}),
         (r"Incorporacion",                                 {"company_name", "registration_number"}),
-        (r"Existencia|Good.Standing|ESTADO",               {"company_name", "registration_number"}),
+        (r"Existencia|Good.Standing|ESTADO",               {"company_name", "registration_number", "issue_date"}),
     ]
 
     # Legacy per-index mapping (fallback if filename doesn't match)
@@ -118,7 +118,9 @@ class FieldValidationExecutor(BaseExecutor):
         "agent_type": ["agentType"],
         "unique_entity_id": ["uniqueEntityId", "samEntityId"],
         "debt_status": [],       # validated via debt logic in _generate_reject_reasons
+        "debt_statement": [],    # captured text of the debt statement
         "compliance_status": [], # validated via ASUME compliance logic
+        "tax_filing_years": [],  # validated via 5-year tax filing check for SC-6088
     }
 
     def __init__(self, id: str, settings=None, **kwargs):
@@ -550,10 +552,15 @@ class FieldValidationExecutor(BaseExecutor):
         validation_score = round(matched / total_compared, 3) if total_compared > 0 else 0.0
 
         # ── Date Execution Window Check (add result to field_results) ──
+        # Only run date checks if this document type requires date validation
+        _doc_requires_expiration = allowed_fields is None or "expiration_date" in (allowed_fields or set())
+        _doc_requires_issue_date = allowed_fields is None or "issue_date" in (allowed_fields or set())
+        _doc_requires_any_date = _doc_requires_expiration or _doc_requires_issue_date
+
         from datetime import datetime as _dt
         _now = _dt.now()
-        expiration_raw = extracted.get("expiration_date", "")
-        issue_raw = extracted.get("issue_date", "") or extracted.get("date", "")
+        expiration_raw = extracted.get("expiration_date", "") if _doc_requires_expiration else ""
+        issue_raw = (extracted.get("issue_date", "") or extracted.get("date", "")) if _doc_requires_issue_date else ""
 
         # Reuse the date parsing logic from _generate_reject_reasons
         SPANISH_MONTHS_QUICK = {
@@ -564,20 +571,38 @@ class FieldValidationExecutor(BaseExecutor):
             "may": "05", "jun": "06", "jul": "07", "ago": "08",
             "sep": "09", "oct": "10", "nov": "11", "dic": "12",
         }
+        ENGLISH_MONTHS_QUICK = {
+            "january": "01", "february": "02", "march": "03", "april": "04",
+            "may": "05", "june": "06", "july": "07", "august": "08",
+            "september": "09", "october": "10", "november": "11", "december": "12",
+            "jan": "01", "feb": "02", "mar": "03", "apr": "04",
+            "jun": "06", "jul": "07", "aug": "08",
+            "sep": "09", "oct": "10", "nov": "11", "dec": "12",
+        }
         def _quick_parse_date(raw):
             if not raw:
                 return None
             raw = raw.strip()
             normalized = re.sub(r'\bde\b', '', raw, flags=re.IGNORECASE).strip()
             normalized = re.sub(r'\s+', ' ', normalized)
+            # Replace Spanish month names
             for sp, num in SPANISH_MONTHS_QUICK.items():
                 pat = re.compile(re.escape(sp), re.IGNORECASE)
                 if pat.search(normalized):
                     normalized = pat.sub(num, normalized)
                     break
-            # Strip dots from abbreviated months (e.g., "15-Aug.-2026" → "15-Aug-2026")
-            normalized = re.sub(r'(\w{3})\.-', r'\1-', normalized)
-            normalized = re.sub(r'\.(\d{4})', r'-\1', normalized)
+            # Replace English month names (locale-independent)
+            for en, num in ENGLISH_MONTHS_QUICK.items():
+                pat = re.compile(r'\b' + re.escape(en) + r'\b', re.IGNORECASE)
+                if pat.search(normalized):
+                    normalized = pat.sub(num, normalized)
+                    break
+            # Remove commas from date strings like "Jul 08, 2026" → "08 2026" after month replacement
+            normalized = re.sub(r',', '', normalized)
+            # Strip dots and extra spaces from DI date formats (e.g., "31-Mar .- 2027" → "31-03-2027")
+            normalized = re.sub(r'\s*\.\s*', '', normalized)  # remove dots with surrounding spaces
+            normalized = re.sub(r'\s*-\s*', '-', normalized)  # normalize dashes (remove spaces around them)
+            normalized = re.sub(r'\s+', ' ', normalized).strip()  # collapse multiple spaces
             for fmt in ("%d/%m/%Y", "%m/%d/%Y", "%d-%m-%Y", "%Y-%m-%d", "%d %m %Y",
                         "%d %B %Y", "%d %b %Y", "%B %d, %Y", "%b %d, %Y",
                         "%d-%b-%Y", "%d-%B-%Y", "%m/%d/%y", "%d/%m/%y",
@@ -632,18 +657,91 @@ class FieldValidationExecutor(BaseExecutor):
         total_compared = matched + mismatched
         validation_score = round(matched / total_compared, 3) if total_compared > 0 else 0.0
 
+        # ── 5-Year Tax Filing Check (add result to field_results for SC-6088) ──
+        if re.search(r'SC-6088|Radicacion.*Planillas.*Ingresos|Radicaci[oó]n.*Planillas', filename, re.IGNORECASE):
+            tax_filing_years = extracted.get("tax_filing_years", {})
+            if tax_filing_years and isinstance(tax_filing_years, dict):
+                from datetime import datetime as _dt2
+                current_year = _dt2.now().year
+                required_years = list(range(current_year - 5, current_year))
+                filed_years = []
+                unfiled_years = []
+                for year in required_years:
+                    status = tax_filing_years.get(year, tax_filing_years.get(str(year), ""))
+                    if status and re.search(r'radicada', str(status), re.IGNORECASE):
+                        filed_years.append(year)
+                    else:
+                        unfiled_years.append(year)
+                tax_check_passed = len(unfiled_years) == 0
+                results["tax_filing_check"] = {
+                    "extracted_value": {str(k): v for k, v in tax_filing_years.items()},
+                    "status": "pass" if tax_check_passed else "fail",
+                    "required_years": required_years,
+                    "filed_years": filed_years,
+                    "unfiled_years": unfiled_years,
+                    "details": (
+                        f"All {len(required_years)} required tax years are filed."
+                        if tax_check_passed else
+                        f"Tax returns not filed for years: {unfiled_years}. Filing is required for the last 5 years."
+                    ),
+                }
+                if tax_check_passed:
+                    matched += 1
+                else:
+                    mismatched += 1
+            else:
+                results["tax_filing_check"] = {
+                    "extracted_value": "not_found",
+                    "status": "fail",
+                    "details": "Tax filing year table could not be extracted from the document.",
+                }
+                mismatched += 1
+            # Recalculate
+            total_compared = matched + mismatched
+            validation_score = round(matched / total_compared, 3) if total_compared > 0 else 0.0
+
+        # ── Debt Balance Verification (add result to field_results for debt documents) ──
+        debt_doc_patterns = [r"SC-6096|Deuda.*HACIENDA|HACIENDA.*Deuda", r"CFSE|Fondo.*Seguro", r"CRIM", r"DTRH.*(?:Desempleo|Incapacidad)"]
+        is_debt_doc = any(re.search(p, filename, re.IGNORECASE) for p in debt_doc_patterns)
+        if is_debt_doc:
+            debt_status = extracted.get("debt_status", "")
+            total_amount = extracted.get("total_amount", "")
+            debt_statement = extracted.get("debt_statement", "")
+            if debt_status == "no_debt":
+                results["debt_verification"] = {
+                    "extracted_value": debt_status,
+                    "status": "pass",
+                    "details": f"Zero-debt balance confirmed. Document states: \"{debt_statement}\"" if debt_statement else "Zero-debt balance confirmed.",
+                }
+                matched += 1
+            elif debt_status == "has_debt":
+                results["debt_verification"] = {
+                    "extracted_value": f"{debt_status} (${total_amount})" if total_amount else debt_status,
+                    "status": "fail",
+                    "details": f"Outstanding debt found on certificate. Amount: ${total_amount}. A zero-debt balance or approved payment plan is required.",
+                }
+                mismatched += 1
+            else:
+                results["debt_verification"] = {
+                    "extracted_value": "not_determined",
+                    "status": "fail",
+                    "details": "Debt status could not be determined from the document's central statement. Unable to confirm zero-debt balance or approved payment plan.",
+                }
+                mismatched += 1
+
+            # Recalculate score with debt check included
+            total_compared = matched + mismatched
+            validation_score = round(matched / total_compared, 3) if total_compared > 0 else 0.0
+
         # Generate reject reasons based on mismatches and validation issues
         reject_reasons = self._generate_reject_reasons(results, extracted, api_data, filename)
 
-        # ── Member Verification (for Policía documents) ──
+        # ── Member Verification ──
+        # NOTE: Per-document check is REMOVED for Policía documents.
+        # The cross-document completeness check in process_input() handles this instead.
+        # (Customer requires: "all authorized members must have certificates" — not per-doc)
         is_member_verification_doc = self._needs_member_verification(filename, doc_index)
-        if is_member_verification_doc:
-            member_reasons = self._verify_authorized_members(extracted, api_data, content)
-            member_reason_id = len(reject_reasons) + 1
-            for mr in member_reasons:
-                mr["id"] = member_reason_id
-                reject_reasons.append(mr)
-                member_reason_id += 1
+
         # ── Determine if document is optional ──
         is_optional = self._is_optional_by_filename(filename) or doc_index in self.OPTIONAL_DOC_INDICES
 
@@ -662,13 +760,9 @@ class FieldValidationExecutor(BaseExecutor):
         }
 
         if is_member_verification_doc:
-            member_details = getattr(self, '_last_member_details', [])
             validation_result["member_verification"] = {
-                "status": "checked",
-                "total_members": len(member_details),
-                "matched": sum(1 for m in member_details if m["status"] == "match"),
-                "unmatched": sum(1 for m in member_details if m["status"] == "unmatch"),
-                "members": member_details,
+                "status": "pending",
+                "note": "Completeness check runs after all documents are processed. Final result will replace this.",
             }
         if is_optional:
             validation_result["optional_note"] = "This document is optional. Validation results are non-determinative for final case verdict."
@@ -814,6 +908,12 @@ class FieldValidationExecutor(BaseExecutor):
                     normalized = pattern.sub(num, normalized)
                     break
 
+            # Clean DI artifacts: dots and extra spaces around separators
+            normalized = re.sub(r',', '', normalized)
+            normalized = re.sub(r'\s*\.\s*', '', normalized)
+            normalized = re.sub(r'\s*-\s*', '-', normalized)
+            normalized = re.sub(r'\s+', ' ', normalized).strip()
+
             # Try many date formats on both raw and normalized versions
             date_formats = (
                 "%d/%m/%Y", "%m/%d/%Y", "%d-%m-%Y", "%m-%d-%Y", "%Y-%m-%d",
@@ -841,8 +941,8 @@ class FieldValidationExecutor(BaseExecutor):
         if not any(re.search(p, filename, re.IGNORECASE) for p, _ in self.VALIDATION_FIELDS_BY_FILENAME):
             _requires_date = True
 
-        expiration_raw = extracted.get("expiration_date", "")
-        issue_raw = extracted.get("issue_date", "") or extracted.get("date", "")
+        expiration_raw = extracted.get("expiration_date", "") if _requires_date else ""
+        issue_raw = (extracted.get("issue_date", "") or extracted.get("date", "")) if _requires_date else ""
         exp_date = _parse_date(expiration_raw)
         issue_date = _parse_date(issue_raw)
 
@@ -876,8 +976,34 @@ class FieldValidationExecutor(BaseExecutor):
         else:
             logger.info(f"No date required for document '{filename}'; skipping date rejection.")
 
-        # ── Debt Verification (SC-6096, CFSE, CRIM) ──────────────────
-        debt_doc_patterns = [r"SC-6096|Deuda.*HACIENDA|HACIENDA.*Deuda", r"CFSE|Fondo.*Seguro", r"CRIM"]
+        # ── 5-Year Tax Filing Check (SC-6088) ──────────────────────────────
+        if re.search(r'SC-6088|Radicacion.*Planillas.*Ingresos|Radicaci[oó]n.*Planillas', filename, re.IGNORECASE):
+            tax_filing_years = extracted.get("tax_filing_years", {})
+            if tax_filing_years and isinstance(tax_filing_years, dict):
+                current_year = datetime.now().year
+                required_years = list(range(current_year - 5, current_year))
+                filed_years = []
+                unfiled_years = []
+                for year in required_years:
+                    status = tax_filing_years.get(year, tax_filing_years.get(str(year), ""))
+                    if status and re.search(r'radicada', str(status), re.IGNORECASE):
+                        filed_years.append(year)
+                    else:
+                        unfiled_years.append(year)
+                tax_check_passed = len(unfiled_years) == 0
+                if not tax_check_passed:
+                    reasons.append({
+                        "id": reason_id,
+                        "RejectionReasonId": self.REJECTION_REASON_IDS.get("tax_filing_missing", 7),
+                        "reason": f"Tax returns have not been filed for all required years. Missing years: {unfiled_years}. The last 5 prior tax years must be marked as filed.",
+                    })
+                    reason_id += 1
+                logger.info(f"Tax filing check: filed={filed_years}, unfiled={unfiled_years}, pass={tax_check_passed}")
+            else:
+                logger.warning(f"Tax filing years table not found in extracted fields for '{filename}'")
+
+        # ── Debt Verification (SC-6096, CFSE, CRIM, DTRH Desempleo/Incapacidad) ──────────────────
+        debt_doc_patterns = [r"SC-6096|Deuda.*HACIENDA|HACIENDA.*Deuda", r"CFSE|Fondo.*Seguro", r"CRIM", r"DTRH.*(?:Desempleo|Incapacidad)"]
         is_debt_doc = any(re.search(p, filename, re.IGNORECASE) for p in debt_doc_patterns)
         if is_debt_doc:
             debt_status = extracted.get("debt_status", "")
@@ -1038,12 +1164,157 @@ class FieldValidationExecutor(BaseExecutor):
                 logger.error(f"Failed to upload error report for {canonical_id}: {upload_err}")
             return content
 
+    def _completeness_check_authorized_members(self, content_items: list):
+        """
+        Cross-document completeness check for Policía (Criminal Record) certificates.
+
+        Validates that EVERY authorized member has a corresponding submitted certificate.
+        This aggregates across ALL police certificate documents, not per-document.
+
+        Returns list of missing member names (empty = PASS).
+        """
+        # Step 1: Get authorized members from API data
+        api_data = None
+        for content in content_items:
+            members = self._find_authorized_members(content.data)
+            if members:
+                api_data = content.data
+                break
+
+        if not api_data:
+            logger.info("Completeness check: No authorizedMembers found in any document's API data.")
+            return []
+
+        members = self._find_authorized_members(api_data)
+        if not members:
+            return []
+
+        # Build the full list of authorized member names
+        import unicodedata
+        def strip_accents(s):
+            return ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
+
+        all_member_names = []
+        for member in members:
+            if isinstance(member, dict):
+                first = member.get("firstName", "") or ""
+                last = member.get("lastName", "") or ""
+                second_surname = member.get("secondLastName", "") or member.get("secondSurname", "") or ""
+                full_name = member.get("name", "") or ""
+                if not full_name and (first or last):
+                    parts = [first, last, second_surname]
+                    full_name = " ".join(p for p in parts if p).strip()
+                elif full_name and second_surname and second_surname.lower() not in full_name.lower():
+                    full_name = f"{full_name} {second_surname}".strip()
+                if full_name:
+                    all_member_names.append(full_name)
+            elif member:
+                all_member_names.append(str(member))
+
+        if not all_member_names:
+            logger.info("Completeness check: No member names resolved from API data.")
+            return []
+
+        # Step 2: Collect names found across ALL Policía certificates
+        covered_members = set()
+        for content in content_items:
+            filename = self._get_filename(content)
+            if not self._needs_member_verification(filename, self._get_doc_index(content)):
+                continue
+
+            # Build searchable text from this certificate
+            extracted = content.data.get("extracted_fields", {})
+            all_text = " ".join(str(v) for v in extracted.values() if isinstance(v, str)).lower()
+            all_text += " " + " ".join(str(k) for k in extracted.keys()).lower()
+
+            di_output = (
+                content.data.get("doc_intell_output")
+                or content.data.get("doc_intelligence_output")
+                or content.data.get("doc_intelligence_result")
+                or {}
+            )
+            raw_text = di_output.get("text", "")
+            if raw_text:
+                all_text += " " + raw_text.lower()
+
+            all_text_normalized = strip_accents(all_text)
+
+            # Check which members appear in this certificate
+            for member_name in all_member_names:
+                name_parts = [p for p in member_name.lower().split() if len(p) > 2]
+                matched_parts = [p for p in name_parts if p in all_text or strip_accents(p) in all_text_normalized]
+                if matched_parts:
+                    covered_members.add(member_name)
+
+        # Step 3: Determine which members are NOT covered
+        missing_members = [name for name in all_member_names if name not in covered_members]
+
+        logger.info(
+            f"Completeness check: {len(covered_members)}/{len(all_member_names)} members covered. "
+            f"Missing: {missing_members}"
+        )
+
+        return {
+            "all_members": all_member_names,
+            "covered_members": list(covered_members),
+            "missing_members": missing_members,
+        }
+
     async def process_input(
         self,
         input: Union['Content', List['Content']],
         ctx: WorkflowContext[Union['Content', List['Content']], Union['Content', List['Content']]]
     ) -> Union['Content', List['Content']]:
         if isinstance(input, list):
-            return [await self._safe_process(item) for item in input]
+            results = [await self._safe_process(item) for item in input]
+
+            # ── Cross-document completeness check for Policía certificates ──
+            try:
+                check_result = self._completeness_check_authorized_members(results)
+                all_members = check_result.get("all_members", [])
+                covered_members = check_result.get("covered_members", [])
+                missing_members = check_result.get("missing_members", [])
+
+                # Build completeness summary to attach to first Policía doc
+                completeness_summary = {
+                    "status": "pass" if not missing_members else "fail",
+                    "total_authorized_members": len(all_members),
+                    "members_with_certificates": covered_members,
+                    "members_missing_certificates": missing_members,
+                }
+
+                # Attach to the FIRST Policía document
+                for content in results:
+                    filename = self._get_filename(content)
+                    if self._needs_member_verification(filename, self._get_doc_index(content)):
+                        validation = content.data.get("validation_result", {})
+                        validation["member_verification"] = completeness_summary
+
+                        if missing_members:
+                            missing_names_str = ", ".join(missing_members)
+                            rejection = {
+                                "id": 950,
+                                "RejectionReasonId": self.REJECTION_REASON_IDS["member_not_found"],
+                                "reason": (
+                                    "Criminal record certificates have not been submitted for all authorized persons. "
+                                    f"Please submit certificates for: {missing_names_str}."
+                                ),
+                            }
+                            if "rejectReasons" in validation:
+                                validation["rejectReasons"].append(rejection)
+                            else:
+                                validation["rejectReasons"] = [rejection]
+                            logger.info(f"Completeness check FAILED: missing certificates for {missing_names_str}")
+                        else:
+                            logger.info("Completeness check PASSED: all authorized members have certificates.")
+
+                        content.data["validation_result"] = validation
+                        # Re-upload the validation report with completeness results
+                        await self._upload_validation_report(content, validation)
+                        break
+            except Exception as e:
+                logger.error(f"Completeness check failed with error: {e}")
+
+            return results
         else:
             return await self._safe_process(input)

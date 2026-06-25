@@ -162,6 +162,9 @@ field_validation_executor ─── Compares extracted fields vs API data
 browser_validation_executor ─── Validates certs against live portals
     │
     ▼
+api_callback_executor ─── Posts results back to Registros API
+    │
+    ▼
 blob_output_executor ─── Uploads final validation reports
 ```
 
@@ -220,7 +223,17 @@ blob_output_executor ─── Uploads final validation reports
    
    The browser validation report is uploaded to the same `validation-results` container alongside the field validation report.
 
-9. **Final Blob Output (`blob_output_executor`):**  
+9. **API Callback (`api_callback_executor`):**  
+   The fourth ASG-custom executor. It aggregates all document validation results and posts them back to the Registros API (Step 5 of the integration flow). The executor:
+   - **Aggregates results** from all documents to determine overall case status (pass/fail).
+   - **Maps each failed document** to its `TramiteRequirementId` from the API data.
+   - **Builds the `apply-analysis` payload** with `TramiteGuid`, `StatusId` (2 = success, 1002 = returned to customer), `Notes` (summary), and `RejectedRequirements` (list of failures with standardized `RejectionReasonId` values).
+   - **Uploads the payload JSON** to the `callback-results` blob container — always, regardless of dry_run mode.
+   - **Authenticates via JWT** (`POST /Authentication/Credentials`) and **POSTs to** `POST /document-intelligence/apply-analysis` — only when `dry_run=false`.
+   
+   Configuration: `api_base_url`, `username`, `password`, `api_key`, `success_status_id` (2), `failure_status_id` (1002), `dry_run` (currently true), `storage_account_name`, `container_name` (callback-results).
+
+10. **Final Blob Output (`blob_output_executor`):**  
    The final executor persists all pipeline results — extracted fields, validation reports, and browser validation reports — to blob storage as the definitive output of the pipeline run.
 
 ### 2.3 Key Design Decision
@@ -943,6 +956,190 @@ validation-results/
 | _08 | Registro de Comerciante | company_name, ein_ssn, merchant_registration | hacienda |
 | _09 | Hacienda (other) | company_name, ein_ssn | hacienda |
 | _10 | Desempleo/Incapacidad (DTRH) | company_name, ein_ssn | validacion_pr |
+| _11 | Choferil | company_name, ein_ssn | validacion_pr |
+| _12 | CFSE (Fondo Seguro Estado) | company_name | — |
+| _13 | DTRH Seguro | company_name, ein_ssn | validacion_pr |
+| _14 | Certificado de Incorporación | company_name | — |
+| _15 | Good Standing / Estado | company_name | — |
+| _16 | ASUME | company_name | validacion_pr |
+| _17 | DTRH | company_name, ein_ssn | validacion_pr |
+| _18 | CRIM | company_name | crim |
+
+---
+
+## Appendix B: Date Validity Windows
+
+| Document Pattern | Window (Days) |
+|-----------------|---------------|
+| SC-2942 / IVU | 30 |
+| SC-6088 / Radicación Planillas | 30 |
+| SC-6096 / Hacienda Deuda | 30 |
+| CRIM | 90 |
+| DTRH | 90 |
+| CFSE | 90 |
+| ASUME | 90 |
+| SAM | 90 |
+| All others | 90 (default) |
+
+---
+
+## Appendix C: Contact & Access
+
+| Role | Name | Contact |
+|------|------|---------|
+| Developer | Ratul Ghosh | v-ratulghosh@microsoft.com |
+
+**Azure Portal:** [https://portal.azure.com](https://portal.azure.com)  
+**Resource Group:** ASG-RG-AILZ-CONTENTFLOW  
+**JumpBox:** Access via Azure Bastion in the AILZ VNet
+
+---
+
+## Appendix A: Document Index Reference
+
+| Index | Document Type | Validation | Portal |
+|-------|--------------|-----------|--------|
+| _00 | Company Profile | Excluded | — |
+| _01 | Declaración Jurada | Excluded | — |
+| _02 | Resolución Corporativa | Optional (company_name) | — |
+| _03 | SAM Entity Information | company_name, unique_entity_id | sam_gov |
+| _04 | Antecedentes Penales (Policía) | company_name, ssn_last_four | validacion_pr |
+| _05 | SC-6088 Radicación Planillas Ingresos | company_name, ein_ssn | hacienda |
+| _06 | SC-6096 Certificación de Deuda Hacienda | company_name, ein_ssn | hacienda |
+| _07 | SC-2942 Planillas IVU | company_name, ein_ssn | hacienda |
+| _08 | Registro de Comerciante | company_name, ein_ssn, merchant_registration | hacienda |
+| _09 | Hacienda (other) | company_name, ein_ssn | hacienda |
+| _10 | Desempleo/Incapacidad (DTRH) | company_name, ein_ssn | validacion_pr |
+| _11 | Choferil | company_name, ein_ssn | validacion_pr |
+| _12 | CFSE (Fondo Seguro Estado) | company_name | — |
+| _13 | DTRH Seguro | company_name, ein_ssn | validacion_pr |
+| _14 | Certificado de Incorporación | company_name | — |
+| _15 | Good Standing / Estado | company_name | — |
+| _16 | ASUME | company_name | validacion_pr |
+| _17 | DTRH | company_name, ein_ssn | validacion_pr |
+| _18 | CRIM | company_name | crim |
+
+---
+
+## Appendix B: Date Validity Windows
+
+| Document Pattern | Window (Days) |
+|-----------------|---------------|
+| SC-2942 / IVU | 30 |
+| SC-6088 / Radicación Planillas | 30 |
+| SC-6096 / Hacienda Deuda | 30 |
+| CRIM | 90 |
+| DTRH | 90 |
+| CFSE | 90 |
+| ASUME | 90 |
+| SAM | 90 |
+| All others | 90 (default) |
+
+---
+
+## Appendix C: Contact & Access
+
+| Role | Name | Contact |
+|------|------|---------|
+| Developer | Ratul Ghosh | v-ratulghosh@microsoft.com |
+
+**Azure Portal:** [https://portal.azure.com](https://portal.azure.com)  
+**Resource Group:** ASG-RG-AILZ-CONTENTFLOW  
+**JumpBox:** Access via Azure Bastion in the AILZ VNet
+>>>>>>> df9a278 (The worker container is pointing to the right script now)
+e, ein_ssn | validacion_pr |
+| _11 | Choferil | company_name, ein_ssn | validacion_pr |
+| _12 | CFSE (Fondo Seguro Estado) | company_name | — |
+| _13 | DTRH Seguro | company_name, ein_ssn | validacion_pr |
+| _14 | Certificado de Incorporación | company_name | — |
+| _15 | Good Standing / Estado | company_name | — |
+| _16 | ASUME | company_name | validacion_pr |
+| _17 | DTRH | company_name, ein_ssn | validacion_pr |
+| _18 | CRIM | company_name | crim |
+
+---
+
+## Appendix B: Date Validity Windows
+
+| Document Pattern | Window (Days) |
+|-----------------|---------------|
+| SC-2942 / IVU | 30 |
+| SC-6088 / Radicación Planillas | 30 |
+| SC-6096 / Hacienda Deuda | 30 |
+| CRIM | 90 |
+| DTRH | 90 |
+| CFSE | 90 |
+| ASUME | 90 |
+| SAM | 90 |
+| All others | 90 (default) |
+
+---
+
+## Appendix C: Contact & Access
+
+| Role | Name | Contact |
+|------|------|---------|
+| Developer | Ratul Ghosh | v-ratulghosh@microsoft.com |
+
+**Azure Portal:** [https://portal.azure.com](https://portal.azure.com)  
+**Resource Group:** ASG-RG-AILZ-CONTENTFLOW  
+**JumpBox:** Access via Azure Bastion in the AILZ VNet
+
+---
+
+## Appendix A: Document Index Reference
+
+| Index | Document Type | Validation | Portal |
+|-------|--------------|-----------|--------|
+| _00 | Company Profile | Excluded | — |
+| _01 | Declaración Jurada | Excluded | — |
+| _02 | Resolución Corporativa | Optional (company_name) | — |
+| _03 | SAM Entity Information | company_name, unique_entity_id | sam_gov |
+| _04 | Antecedentes Penales (Policía) | company_name, ssn_last_four | validacion_pr |
+| _05 | SC-6088 Radicación Planillas Ingresos | company_name, ein_ssn | hacienda |
+| _06 | SC-6096 Certificación de Deuda Hacienda | company_name, ein_ssn | hacienda |
+| _07 | SC-2942 Planillas IVU | company_name, ein_ssn | hacienda |
+| _08 | Registro de Comerciante | company_name, ein_ssn, merchant_registration | hacienda |
+| _09 | Hacienda (other) | company_name, ein_ssn | hacienda |
+| _10 | Desempleo/Incapacidad (DTRH) | company_name, ein_ssn | validacion_pr |
+| _11 | Choferil | company_name, ein_ssn | validacion_pr |
+| _12 | CFSE (Fondo Seguro Estado) | company_name | — |
+| _13 | DTRH Seguro | company_name, ein_ssn | validacion_pr |
+| _14 | Certificado de Incorporación | company_name | — |
+| _15 | Good Standing / Estado | company_name | — |
+| _16 | ASUME | company_name | validacion_pr |
+| _17 | DTRH | company_name, ein_ssn | validacion_pr |
+| _18 | CRIM | company_name | crim |
+
+---
+
+## Appendix B: Date Validity Windows
+
+| Document Pattern | Window (Days) |
+|-----------------|---------------|
+| SC-2942 / IVU | 30 |
+| SC-6088 / Radicación Planillas | 30 |
+| SC-6096 / Hacienda Deuda | 30 |
+| CRIM | 90 |
+| DTRH | 90 |
+| CFSE | 90 |
+| ASUME | 90 |
+| SAM | 90 |
+| All others | 90 (default) |
+
+---
+
+## Appendix C: Contact & Access
+
+| Role | Name | Contact |
+|------|------|---------|
+| Developer | Ratul Ghosh | v-ratulghosh@microsoft.com |
+
+**Azure Portal:** [https://portal.azure.com](https://portal.azure.com)  
+**Resource Group:** ASG-RG-AILZ-CONTENTFLOW  
+**JumpBox:** Access via Azure Bastion in the AILZ VNet
+>>>>>>> df9a278 (The worker container is pointing to the right script now)
+e, ein_ssn | validacion_pr |
 | _11 | Choferil | company_name, ein_ssn | validacion_pr |
 | _12 | CFSE (Fondo Seguro Estado) | company_name | — |
 | _13 | DTRH Seguro | company_name, ein_ssn | validacion_pr |
